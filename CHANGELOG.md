@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5] - Hash fusion and load smoothing pass
+- Fused eligible hash stages with vector multiply_add to reduce valu ops.
+- Interleaved next-batch load_offset across hash stages to smooth load pressure.
+- Replaced parity modulo with bitwise parity in vector and scalar paths.
+- Test cycles: `tests/submission_tests.py` -> 9324 cycles.
+
 ## [0.4] - Deep pipeline optimization pass
 - Interleaved next-batch gather into hash stages to overlap load/valu.
 - Prefetched next-batch vload/addr setup before staged gather.

@@ -212,9 +212,14 @@ class KernelBuilder:
         slots = []
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                factor = 1 + (1 << val3)
+                slots.append(("alu", ("*", tmp1, val_hash_addr, self.scratch_const(factor))))
+                slots.append(("alu", ("+", val_hash_addr, tmp1, self.scratch_const(val1))))
+            else:
+                slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
+                slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
+                slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
             if self.enable_debug:
                 slots.append(
                     ("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi)))
@@ -375,32 +380,40 @@ class KernelBuilder:
                         keys = [(round, next_i + lane, "val") for lane in range(VLEN)]
                         body.append(("debug", ("vcompare", next_buf["val"], keys)))
                     body.append(
-                        ("valu", ("+", next_buf["addr"], next_buf["idx"], forest_base_v))
+                            ("valu", ("+", next_buf["addr"], next_buf["idx"], forest_base_v))
                     )
                 body.append(("valu", ("^", buf["val"], buf["val"], buf["node"])))
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    v1 = self.scratch_const_vector(val1)
-                    v3 = self.scratch_const_vector(val3)
-                    body.append(("valu", (op1, tmp1_v, buf["val"], v1)))
-                    body.append(("valu", (op3, tmp2_v, buf["val"], v3)))
+                    if op1 == "+" and op2 == "+" and op3 == "<<":
+                        factor = 1 + (1 << val3)
+                        vf = self.scratch_const_vector(factor)
+                        v1 = self.scratch_const_vector(val1)
+                        body.append(("valu", ("multiply_add", buf["val"], buf["val"], vf, v1)))
+                    else:
+                        v1 = self.scratch_const_vector(val1)
+                        v3 = self.scratch_const_vector(val3)
+                        body.append(("valu", (op1, tmp1_v, buf["val"], v1)))
+                        body.append(("valu", (op3, tmp2_v, buf["val"], v3)))
+                        body.append(("valu", (op2, buf["val"], tmp1_v, tmp2_v)))
                     if next_buf is not None and load_lane < VLEN:
-                        for _ in range(2):
-                            if load_lane >= VLEN:
-                                break
-                            body.append(
-                                ("load", ("load_offset", next_buf["node"], next_buf["addr"], load_lane))
-                            )
-                            load_lane += 1
-                    body.append(("valu", (op2, buf["val"], tmp1_v, tmp2_v)))
+                        body.append(
+                            ("load", ("load_offset", next_buf["node"], next_buf["addr"], load_lane))
+                        )
+                        load_lane += 1
                     if self.enable_debug:
                         keys = [
                             (round, i + lane, "hash_stage", hi) for lane in range(VLEN)
                         ]
                         body.append(("debug", ("vcompare", buf["val"], keys)))
+                if next_buf is not None and load_lane < VLEN:
+                    for lane in range(load_lane, VLEN):
+                        body.append(
+                            ("load", ("load_offset", next_buf["node"], next_buf["addr"], lane))
+                        )
                 if self.enable_debug:
                     keys = [(round, i + lane, "hashed_val") for lane in range(VLEN)]
                     body.append(("debug", ("vcompare", buf["val"], keys)))
-                body.append(("valu", ("%", tmp1_v, buf["val"], two_v)))
+                body.append(("valu", ("&", tmp1_v, buf["val"], one_v)))
                 body.append(("valu", ("+", tmp1_v, tmp1_v, one_v)))
                 body.append(("valu", ("*", buf["idx"], buf["idx"], two_v)))
                 body.append(("valu", ("+", buf["idx"], buf["idx"], tmp1_v)))
@@ -453,9 +466,8 @@ class KernelBuilder:
                 if self.enable_debug:
                     body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
+                body.append(("alu", ("&", tmp1, tmp_val, one_const)))
+                body.append(("alu", ("+", tmp3, tmp1, one_const)))
                 body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
                 body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
                 if self.enable_debug:
