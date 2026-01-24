@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented here.
 
+## [0.4] - Deep pipeline optimization pass
+- Interleaved next-batch gather into hash stages to overlap load/valu.
+- Prefetched next-batch vload/addr setup before staged gather.
+- Test cycles: `tests/submission_tests.py` -> 10862 cycles.
+
 ## [0.3] - Pipeline optimization pass
 - Added double-buffered vector scratch to overlap gather with hash/commit.
 - Introduced pipelined vector load/compute schedule for batch chunks.

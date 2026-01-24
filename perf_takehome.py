@@ -350,9 +350,53 @@ class KernelBuilder:
                     keys = [(round, i + lane, "node_val") for lane in range(VLEN)]
                     body.append(("debug", ("vcompare", buf["node"], keys)))
 
-            def emit_vec_compute(i, buf):
+            def emit_vec_compute(i, buf, next_i=None, next_buf=None):
+                load_lane = 0
+                if next_i is not None and next_buf is not None:
+                    i_const = self.scratch_const(next_i)
+                    body.append(
+                        (
+                            "alu",
+                            ("+", next_buf["idx_addr"], self.scratch["inp_indices_p"], i_const),
+                        )
+                    )
+                    body.append(("load", ("vload", next_buf["idx"], next_buf["idx_addr"])))
+                    if self.enable_debug:
+                        keys = [(round, next_i + lane, "idx") for lane in range(VLEN)]
+                        body.append(("debug", ("vcompare", next_buf["idx"], keys)))
+                    body.append(
+                        (
+                            "alu",
+                            ("+", next_buf["val_addr"], self.scratch["inp_values_p"], i_const),
+                        )
+                    )
+                    body.append(("load", ("vload", next_buf["val"], next_buf["val_addr"])))
+                    if self.enable_debug:
+                        keys = [(round, next_i + lane, "val") for lane in range(VLEN)]
+                        body.append(("debug", ("vcompare", next_buf["val"], keys)))
+                    body.append(
+                        ("valu", ("+", next_buf["addr"], next_buf["idx"], forest_base_v))
+                    )
                 body.append(("valu", ("^", buf["val"], buf["val"], buf["node"])))
-                body.extend(self.build_hash_vector(buf["val"], tmp1_v, tmp2_v, round, i))
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    v1 = self.scratch_const_vector(val1)
+                    v3 = self.scratch_const_vector(val3)
+                    body.append(("valu", (op1, tmp1_v, buf["val"], v1)))
+                    body.append(("valu", (op3, tmp2_v, buf["val"], v3)))
+                    if next_buf is not None and load_lane < VLEN:
+                        for _ in range(2):
+                            if load_lane >= VLEN:
+                                break
+                            body.append(
+                                ("load", ("load_offset", next_buf["node"], next_buf["addr"], load_lane))
+                            )
+                            load_lane += 1
+                    body.append(("valu", (op2, buf["val"], tmp1_v, tmp2_v)))
+                    if self.enable_debug:
+                        keys = [
+                            (round, i + lane, "hash_stage", hi) for lane in range(VLEN)
+                        ]
+                        body.append(("debug", ("vcompare", buf["val"], keys)))
                 if self.enable_debug:
                     keys = [(round, i + lane, "hashed_val") for lane in range(VLEN)]
                     body.append(("debug", ("vcompare", buf["val"], keys)))
@@ -378,8 +422,9 @@ class KernelBuilder:
                     next_i = i + VLEN
                     if next_i < vec_end:
                         next_buf = buffers[((i // VLEN) + 1) % 2]
-                        emit_vec_load(next_i, next_buf)
-                    emit_vec_compute(i, buf)
+                        emit_vec_compute(i, buf, next_i, next_buf)
+                    else:
+                        emit_vec_compute(i, buf)
 
             for i in range(vec_end, batch_size):
                 i_const = self.scratch_const(i)
