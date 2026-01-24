@@ -312,175 +312,137 @@ class KernelBuilder:
         )
 
         vec_end = batch_size - (batch_size % VLEN)
-        for round in range(rounds):
-            buffers = [
-                {
-                    "idx": idx_v0,
-                    "val": val_v0,
-                    "node": node_v0,
-                    "addr": addr_v0,
-                    "idx_addr": tmp_idx_addr0,
-                    "val_addr": tmp_val_addr0,
-                },
-                {
-                    "idx": idx_v1,
-                    "val": val_v1,
-                    "node": node_v1,
-                    "addr": addr_v1,
-                    "idx_addr": tmp_idx_addr1,
-                    "val_addr": tmp_val_addr1,
-                },
-            ]
+        buffers = [
+            {
+                "idx": idx_v0,
+                "val": val_v0,
+                "node": node_v0,
+                "addr": addr_v0,
+                "idx_addr": tmp_idx_addr0,
+                "val_addr": tmp_val_addr0,
+            },
+            {
+                "idx": idx_v1,
+                "val": val_v1,
+                "node": node_v1,
+                "addr": addr_v1,
+                "idx_addr": tmp_idx_addr1,
+                "val_addr": tmp_val_addr1,
+            },
+        ]
 
-            def emit_vec_load(i, buf):
-                i_const = self.scratch_const(i)
-                body.append(
-                    ("alu", ("+", buf["idx_addr"], self.scratch["inp_indices_p"], i_const))
-                )
-                body.append(("load", ("vload", buf["idx"], buf["idx_addr"])))
+        def emit_vec_load(i, buf):
+            i_const = self.scratch_const(i)
+            body.append(
+                ("alu", ("+", buf["idx_addr"], self.scratch["inp_indices_p"], i_const))
+            )
+            body.append(("load", ("vload", buf["idx"], buf["idx_addr"])))
+            body.append(
+                ("alu", ("+", buf["val_addr"], self.scratch["inp_values_p"], i_const))
+            )
+            body.append(("load", ("vload", buf["val"], buf["val_addr"])))
+
+        def emit_vec_round(round_i, i, buf):
+            if self.enable_debug:
+                keys = [(round_i, i + lane, "idx") for lane in range(VLEN)]
+                body.append(("debug", ("vcompare", buf["idx"], keys)))
+                keys = [(round_i, i + lane, "val") for lane in range(VLEN)]
+                body.append(("debug", ("vcompare", buf["val"], keys)))
+            body.append(("valu", ("+", buf["addr"], buf["idx"], forest_base_v)))
+            for lane in range(VLEN):
+                body.append(("load", ("load_offset", buf["node"], buf["addr"], lane)))
+            if self.enable_debug:
+                keys = [(round_i, i + lane, "node_val") for lane in range(VLEN)]
+                body.append(("debug", ("vcompare", buf["node"], keys)))
+            body.append(("valu", ("^", buf["val"], buf["val"], buf["node"])))
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                if op1 == "+" and op2 == "+" and op3 == "<<":
+                    factor = 1 + (1 << val3)
+                    vf = self.scratch_const_vector(factor)
+                    v1 = self.scratch_const_vector(val1)
+                    body.append(("valu", ("multiply_add", buf["val"], buf["val"], vf, v1)))
+                else:
+                    v1 = self.scratch_const_vector(val1)
+                    v3 = self.scratch_const_vector(val3)
+                    body.append(("valu", (op1, tmp1_v, buf["val"], v1)))
+                    body.append(("valu", (op3, tmp2_v, buf["val"], v3)))
+                    body.append(("valu", (op2, buf["val"], tmp1_v, tmp2_v)))
                 if self.enable_debug:
-                    keys = [(round, i + lane, "idx") for lane in range(VLEN)]
-                    body.append(("debug", ("vcompare", buf["idx"], keys)))
-                body.append(
-                    ("alu", ("+", buf["val_addr"], self.scratch["inp_values_p"], i_const))
-                )
-                body.append(("load", ("vload", buf["val"], buf["val_addr"])))
-                if self.enable_debug:
-                    keys = [(round, i + lane, "val") for lane in range(VLEN)]
+                    keys = [
+                        (round_i, i + lane, "hash_stage", hi) for lane in range(VLEN)
+                    ]
                     body.append(("debug", ("vcompare", buf["val"], keys)))
-                body.append(("valu", ("+", buf["addr"], buf["idx"], forest_base_v)))
-                for lane in range(VLEN):
-                    body.append(("load", ("load_offset", buf["node"], buf["addr"], lane)))
-                if self.enable_debug:
-                    keys = [(round, i + lane, "node_val") for lane in range(VLEN)]
-                    body.append(("debug", ("vcompare", buf["node"], keys)))
+            if self.enable_debug:
+                keys = [(round_i, i + lane, "hashed_val") for lane in range(VLEN)]
+                body.append(("debug", ("vcompare", buf["val"], keys)))
+            body.append(("valu", ("&", tmp1_v, buf["val"], one_v)))
+            body.append(("valu", ("+", tmp1_v, tmp1_v, one_v)))
+            body.append(("valu", ("*", buf["idx"], buf["idx"], two_v)))
+            body.append(("valu", ("+", buf["idx"], buf["idx"], tmp1_v)))
+            if self.enable_debug:
+                keys = [(round_i, i + lane, "next_idx") for lane in range(VLEN)]
+                body.append(("debug", ("vcompare", buf["idx"], keys)))
+            body.append(("valu", ("<", tmp1_v, buf["idx"], n_nodes_v)))
+            body.append(("valu", ("*", buf["idx"], buf["idx"], tmp1_v)))
+            if self.enable_debug:
+                keys = [(round_i, i + lane, "wrapped_idx") for lane in range(VLEN)]
+                body.append(("debug", ("vcompare", buf["idx"], keys)))
 
-            def emit_vec_compute(i, buf, next_i=None, next_buf=None):
-                load_lane = 0
-                if next_i is not None and next_buf is not None:
-                    i_const = self.scratch_const(next_i)
-                    body.append(
-                        (
-                            "alu",
-                            ("+", next_buf["idx_addr"], self.scratch["inp_indices_p"], i_const),
-                        )
-                    )
-                    body.append(("load", ("vload", next_buf["idx"], next_buf["idx_addr"])))
-                    if self.enable_debug:
-                        keys = [(round, next_i + lane, "idx") for lane in range(VLEN)]
-                        body.append(("debug", ("vcompare", next_buf["idx"], keys)))
-                    body.append(
-                        (
-                            "alu",
-                            ("+", next_buf["val_addr"], self.scratch["inp_values_p"], i_const),
-                        )
-                    )
-                    body.append(("load", ("vload", next_buf["val"], next_buf["val_addr"])))
-                    if self.enable_debug:
-                        keys = [(round, next_i + lane, "val") for lane in range(VLEN)]
-                        body.append(("debug", ("vcompare", next_buf["val"], keys)))
-                    body.append(
-                            ("valu", ("+", next_buf["addr"], next_buf["idx"], forest_base_v))
-                    )
-                body.append(("valu", ("^", buf["val"], buf["val"], buf["node"])))
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    if op1 == "+" and op2 == "+" and op3 == "<<":
-                        factor = 1 + (1 << val3)
-                        vf = self.scratch_const_vector(factor)
-                        v1 = self.scratch_const_vector(val1)
-                        body.append(("valu", ("multiply_add", buf["val"], buf["val"], vf, v1)))
-                    else:
-                        v1 = self.scratch_const_vector(val1)
-                        v3 = self.scratch_const_vector(val3)
-                        body.append(("valu", (op1, tmp1_v, buf["val"], v1)))
-                        body.append(("valu", (op3, tmp2_v, buf["val"], v3)))
-                        body.append(("valu", (op2, buf["val"], tmp1_v, tmp2_v)))
-                    if next_buf is not None and load_lane < VLEN:
-                        body.append(
-                            ("load", ("load_offset", next_buf["node"], next_buf["addr"], load_lane))
-                        )
-                        load_lane += 1
-                    if self.enable_debug:
-                        keys = [
-                            (round, i + lane, "hash_stage", hi) for lane in range(VLEN)
-                        ]
-                        body.append(("debug", ("vcompare", buf["val"], keys)))
-                if next_buf is not None and load_lane < VLEN:
-                    for lane in range(load_lane, VLEN):
-                        body.append(
-                            ("load", ("load_offset", next_buf["node"], next_buf["addr"], lane))
-                        )
-                if self.enable_debug:
-                    keys = [(round, i + lane, "hashed_val") for lane in range(VLEN)]
-                    body.append(("debug", ("vcompare", buf["val"], keys)))
-                body.append(("valu", ("&", tmp1_v, buf["val"], one_v)))
-                body.append(("valu", ("+", tmp1_v, tmp1_v, one_v)))
-                body.append(("valu", ("*", buf["idx"], buf["idx"], two_v)))
-                body.append(("valu", ("+", buf["idx"], buf["idx"], tmp1_v)))
-                if self.enable_debug:
-                    keys = [(round, i + lane, "next_idx") for lane in range(VLEN)]
-                    body.append(("debug", ("vcompare", buf["idx"], keys)))
-                body.append(("valu", ("<", tmp1_v, buf["idx"], n_nodes_v)))
-                body.append(("valu", ("*", buf["idx"], buf["idx"], tmp1_v)))
-                if self.enable_debug:
-                    keys = [(round, i + lane, "wrapped_idx") for lane in range(VLEN)]
-                    body.append(("debug", ("vcompare", buf["idx"], keys)))
-                body.append(("store", ("vstore", buf["idx_addr"], buf["idx"])))
-                body.append(("store", ("vstore", buf["val_addr"], buf["val"])))
+        def emit_vec_store(buf):
+            body.append(("store", ("vstore", buf["idx_addr"], buf["idx"])))
+            body.append(("store", ("vstore", buf["val_addr"], buf["val"])))
 
-            if vec_end > 0:
-                emit_vec_load(0, buffers[0])
-                for i in range(0, vec_end, VLEN):
-                    buf = buffers[(i // VLEN) % 2]
-                    next_i = i + VLEN
-                    if next_i < vec_end:
-                        next_buf = buffers[((i // VLEN) + 1) % 2]
-                        emit_vec_compute(i, buf, next_i, next_buf)
-                    else:
-                        emit_vec_compute(i, buf)
+        for i in range(0, vec_end, VLEN):
+            buf = buffers[(i // VLEN) % 2]
+            emit_vec_load(i, buf)
+            for round_i in range(rounds):
+                emit_vec_round(round_i, i, buf)
+            emit_vec_store(buf)
 
-            for i in range(vec_end, batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
+        for i in range(vec_end, batch_size):
+            i_const = self.scratch_const(i)
+            body.append(
+                ("alu", ("+", tmp_idx_addr, self.scratch["inp_indices_p"], i_const))
+            )
+            body.append(("load", ("load", tmp_idx, tmp_idx_addr)))
+            body.append(
+                ("alu", ("+", tmp_val_addr, self.scratch["inp_values_p"], i_const))
+            )
+            body.append(("load", ("load", tmp_val, tmp_val_addr)))
+            for round_i in range(rounds):
+                if self.enable_debug:
+                    body.append(("debug", ("compare", tmp_idx, (round_i, i, "idx"))))
+                    body.append(("debug", ("compare", tmp_val, (round_i, i, "val"))))
                 body.append(
-                    ("alu", ("+", tmp_idx_addr, self.scratch["inp_indices_p"], i_const))
+                    ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx))
                 )
-                body.append(("load", ("load", tmp_idx, tmp_idx_addr)))
-                if self.enable_debug:
-                    body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(
-                    ("alu", ("+", tmp_val_addr, self.scratch["inp_values_p"], i_const))
-                )
-                body.append(("load", ("load", tmp_val, tmp_val_addr)))
-                if self.enable_debug:
-                    body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
                 body.append(("load", ("load", tmp_node_val, tmp_addr)))
                 if self.enable_debug:
-                    body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
+                    body.append(
+                        ("debug", ("compare", tmp_node_val, (round_i, i, "node_val")))
+                    )
                 body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
+                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round_i, i))
                 if self.enable_debug:
-                    body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
+                    body.append(
+                        ("debug", ("compare", tmp_val, (round_i, i, "hashed_val")))
+                    )
                 body.append(("alu", ("&", tmp1, tmp_val, one_const)))
                 body.append(("alu", ("+", tmp3, tmp1, one_const)))
                 body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
                 body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
                 if self.enable_debug:
-                    body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
+                    body.append(
+                        ("debug", ("compare", tmp_idx, (round_i, i, "next_idx")))
+                    )
                 body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
                 body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
                 if self.enable_debug:
-                    body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("store", ("store", tmp_idx_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("store", ("store", tmp_val_addr, tmp_val)))
+                    body.append(
+                        ("debug", ("compare", tmp_idx, (round_i, i, "wrapped_idx")))
+                    )
+            body.append(("store", ("store", tmp_idx_addr, tmp_idx)))
+            body.append(("store", ("store", tmp_val_addr, tmp_val)))
 
         body_instrs = self.build(body, vliw=True)
         self.instrs.extend(body_instrs)

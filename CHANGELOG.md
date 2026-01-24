@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented here.
 
+## [0.6] - Round-local scratch residency pass
+- Reordered loops to keep idx/val in scratch across rounds with single load/store.
+- Kept hash fusion and parity bit optimizations in vector/scalar paths.
+- Test cycles: `tests/submission_tests.py` -> 10380 cycles.
+
 ## [0.5] - Hash fusion and load smoothing pass
 - Fused eligible hash stages with vector multiply_add to reduce valu ops.
 - Interleaved next-batch load_offset across hash stages to smooth load pressure.
