@@ -9,6 +9,7 @@ from copy import copy
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal
+import os
 import random
 
 Engine = Literal["alu", "load", "store", "flow"]
@@ -102,6 +103,7 @@ class Machine:
         n_cores: int = 1,
         scratch_size: int = SCRATCH_SIZE,
         trace: bool = False,
+        trace_path: str | None = None,
         value_trace: dict[Any, int] = {},
     ):
         self.cores = [
@@ -115,6 +117,7 @@ class Machine:
         self.cycle = 0
         self.enable_pause = True
         self.enable_debug = True
+        self.trace_path = trace_path
         if trace:
             self.setup_trace()
         else:
@@ -157,7 +160,11 @@ class Machine:
         See the format docs in case you want to add more info to the trace:
         https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview
         """
-        self.trace = open("trace.json", "w")
+        trace_path = self.trace_path or os.path.join("trace", "trace.json")
+        trace_dir = os.path.dirname(trace_path)
+        if trace_dir:
+            os.makedirs(trace_dir, exist_ok=True)
+        self.trace = open(trace_path, "w")
         self.trace.write("[")
         tid_counter = 0
         self.tids = {}

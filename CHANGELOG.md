@@ -2,9 +2,25 @@
 
 All notable changes to this project will be documented here.
 
+## [0.3] - Pipeline optimization pass
+- Added double-buffered vector scratch to overlap gather with hash/commit.
+- Introduced pipelined vector load/compute schedule for batch chunks.
+- Test cycles: `tests/submission_tests.py` -> 12846 cycles.
+
+## [0.2] - Vectorization pass
+- Added SIMD vector path for inner loop with scalar tail fallback.
+- Switched vector wrap/branch logic to ALU/VALU to reduce flow pressure.
+- Test cycles: `tests/submission_tests.py` -> 13389 cycles.
+
+## [0.1] - Kernel optimization pass
+- Added conservative VLIW slot packing to reduce instruction bundle count.
+- Reused computed input addresses to avoid redundant ALU address calculations.
+- Made debug compares optional to keep the packed schedule deterministic.
+- Test cycles: `tests/submission_tests.py` -> 98582 cycles.
+- Trace output now defaults to `trace/trace.json` when enabled.
+
 ## [0.0] - Initial import
 - Imported upstream Anthropic original performance take-home.
 - Added `architecture/` with overview and diagrams.
 - Added `optimizations/v1.0-optimizations.md` planning document.
 - No code changes to kernel or simulator; baseline preserved.
-
