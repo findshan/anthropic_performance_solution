@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented here.
 
+## [1.0] - VLIW 调度器升级 & 架构深度文档化
+- **性能突破**: 实现了从贪心打包到**依赖感知列表调度 (List Scheduling)** 的质变，Cycle 数从 ~2402 降至 **1771** (提升 ~26%)。
+- **调度器优化**:
+    - 精确建模 RAW, WAW, WAR 依赖，支持写后读 (WAR) 同周期发射。
+    - 引入基于关键路径 (Rank) 的优先级排序，最大化流水线填充率。
+    - 优化 Slot 分配策略，平衡 Load 与 VALU 压力。
+- **架构文档化 (中文)**:
+    - 编写了详尽的 [v1.0-vliw-scheduler.md](file:///Users/findshan/Documents/Projects/ai_PROJECT/codex_promote/source_repo/architecture/v1.0-vliw-scheduler.md)，包含依赖图、调度流程图及流水线填充对比图。
+    - 增加了理论性能分析，推导了 1525 cycle 的下界极限，并对比了实际性能表现。
+- **工程改进**:
+    - 删除了冗余的初始 idx_buf 清零和常量加载，减少了基础指令开销。
+    - 优化了 batch=256 场景下的尾部处理逻辑。
+
 ## [0.8] - Depth-aware wrap elimination pass
 - Skipped idx wrap checks on non-terminal depths; simplified depth-0 idx update.
 - Reduced valu ops from ~9780 to ~8756 and lowered cycles to 2423.
