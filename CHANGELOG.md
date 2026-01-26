@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented here.
 
+## [0.7] - Grouped hash pipeline with overlapped gather
+- Grouped vector blocks into 6-way pipelines to pack VALU slots per stage and reduce bundle count.
+- Added round-depth specialization for depth 0/1 to avoid gather loads on root/first-level nodes.
+- Interleaved next-group gather loads during current-group hash/idx to raise load/valu utilization.
+- Test cycles: `tests/submission_tests.py` -> 2525 cycles.
+
 ## [0.6] - Round-local scratch residency pass
 - Reordered loops to keep idx/val in scratch across rounds with single load/store.
 - Kept hash fusion and parity bit optimizations in vector/scalar paths.
