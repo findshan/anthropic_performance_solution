@@ -496,6 +496,28 @@ class KernelBuilder:
                     else None
                 )
 
+                # Helper to decide if we should scalarize a specific vector index
+                def should_force_alu(i):
+                    # Experiment with this condition. 
+                    # i % 5 == 4 targets 20%. (Optimal found: 1692 cycles)
+                    return (i % 5 == 4)
+
+                def add_op(inst, force_alu=False):
+                    type, args = inst
+                    # Intercept VALU ops if force_alu is requested
+                    if force_alu and type == "valu":
+                        op = args[0]
+                        # Supported ALU ops
+                        if op in ["+", "-", "&", "^", "|", "<<", ">>", "*", "<"]: 
+                            # Unroll 8 lanes
+                            for lane in range(VLEN):
+                                lane_args = [op]
+                                for arg in args[1:]:
+                                    lane_args.append(arg + lane)
+                                body.append(("alu", tuple(lane_args)))
+                            return
+                    body.append((type, args))
+
                 if self.enable_debug:
                     for i in group:
                         keys = [(round_i, i + lane, "idx") for lane in range(VLEN)]
@@ -509,18 +531,18 @@ class KernelBuilder:
                         for gi, i in enumerate(group):
                             lane_base = gi * VLEN
                             addr_v = addr_v_base + lane_base
-                            body.append(("valu", ("+", addr_v, idx_buf + i, forest_base_v)))
+                            add_op(("valu", ("+", addr_v, idx_buf + i, forest_base_v)), force_alu=should_force_alu(i))
                         for gi, i in enumerate(group):
                             lane_base = gi * VLEN
                             addr_v = addr_v_base + lane_base
                             node_v = cur_node_base + lane_base
                             for lane in range(VLEN):
-                                body.append(("load", ("load_offset", node_v, addr_v, lane)))
+                                add_op(("load", ("load_offset", node_v, addr_v, lane)))
                     if next_group:
                         for gi, i in enumerate(next_group):
                             lane_base = gi * VLEN
                             addr_v = addr_v_base + lane_base
-                            body.append(("valu", ("+", addr_v, idx_buf + i, forest_base_v)))
+                            add_op(("valu", ("+", addr_v, idx_buf + i, forest_base_v)), force_alu=should_force_alu(i))
                         for gi, i in enumerate(next_group):
                             lane_base = gi * VLEN
                             addr_v = addr_v_base + lane_base
@@ -539,24 +561,24 @@ class KernelBuilder:
                     for _ in range(load_per_point):
                         if load_idx[0] >= len(load_slots_next):
                             break
-                        body.append(load_slots_next[load_idx[0]])
+                        add_op(load_slots_next[load_idx[0]])
                         load_idx[0] += 1
 
                 if use_children:
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
-                        body.append(("valu", ("&", tmp1_v, idx_buf + i, one_v)))
+                        add_op(("valu", ("&", tmp1_v, idx_buf + i, one_v)), force_alu=should_force_alu(i))
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
                         node_v = cur_node_base + lane_base
-                        body.append(
+                        add_op(
                             (
                                 "valu",
                                 ("multiply_add", node_v, tmp1_v, left_minus_right_v, right_v),
-                            )
+                            ), force_alu=False
                         )
                     emit_loads()
 
@@ -564,24 +586,24 @@ class KernelBuilder:
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
-                        body.append(("valu", ("-", tmp1_v, idx_buf + i, three_v)))
+                        add_op(("valu", ("-", tmp1_v, idx_buf + i, three_v)), force_alu=should_force_alu(i))
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
                         tmp2_v = tmp2_v_base + lane_base
-                        body.append(("valu", ("&", tmp2_v, tmp1_v, one_v)))
+                        add_op(("valu", ("&", tmp2_v, tmp1_v, one_v)), force_alu=should_force_alu(i))
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
-                        body.append(("valu", (">>", tmp1_v, tmp1_v, one_v)))
+                        add_op(("valu", (">>", tmp1_v, tmp1_v, one_v)), force_alu=should_force_alu(i))
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp2_v = tmp2_v_base + lane_base
                         node_v = cur_node_base + lane_base
-                        body.append(
+                        add_op(
                             (
                                 "valu",
                                 (
@@ -591,13 +613,13 @@ class KernelBuilder:
                                     d2_delta34_v,
                                     d2_node3_v,
                                 ),
-                            )
+                            ), force_alu=False
                         )
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp2_v = tmp2_v_base + lane_base
-                        body.append(
+                        add_op(
                             (
                                 "valu",
                                 (
@@ -607,58 +629,58 @@ class KernelBuilder:
                                     d2_delta56_v,
                                     d2_node5_v,
                                 ),
-                            )
+                            ), force_alu=False
                         )
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp2_v = tmp2_v_base + lane_base
                         node_v = cur_node_base + lane_base
-                        body.append(("valu", ("-", tmp2_v, tmp2_v, node_v)))
+                        add_op(("valu", ("-", tmp2_v, tmp2_v, node_v)), force_alu=should_force_alu(i))
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
                         tmp2_v = tmp2_v_base + lane_base
                         node_v = cur_node_base + lane_base
-                        body.append(
-                            ("valu", ("multiply_add", node_v, tmp1_v, tmp2_v, node_v))
+                        add_op(
+                            ("valu", ("multiply_add", node_v, tmp1_v, tmp2_v, node_v)), force_alu=False
                         )
                     emit_loads()
 
                 for gi, i in enumerate(group):
                     lane_base = gi * VLEN
                     node_src = root_v if use_root else cur_node_base + lane_base
-                    body.append(("valu", ("^", val_buf + i, val_buf + i, node_src)))
+                    add_op(("valu", ("^", val_buf + i, val_buf + i, node_src)), force_alu=should_force_alu(i))
                 emit_loads()
 
                 for hi, plan in enumerate(hash_plan):
                     match plan:
                         case ("fused_add", factor_v, v1):
                             for gi, i in enumerate(group):
-                                body.append(
+                                add_op(
                                     (
                                         "valu",
                                         ("multiply_add", val_buf + i, val_buf + i, factor_v, v1),
-                                    )
+                                    ), force_alu=False
                                 )
                             emit_loads()
                         case ("generic", v1, v3, op1, op2, op3):
                             for gi, i in enumerate(group):
                                 lane_base = gi * VLEN
                                 tmp1_v = tmp1_v_base + lane_base
-                                body.append(("valu", (op1, tmp1_v, val_buf + i, v1)))
+                                add_op(("valu", (op1, tmp1_v, val_buf + i, v1)), force_alu=should_force_alu(i))
                             emit_loads()
                             for gi, i in enumerate(group):
                                 lane_base = gi * VLEN
                                 tmp2_v = tmp2_v_base + lane_base
-                                body.append(("valu", (op3, tmp2_v, val_buf + i, v3)))
+                                add_op(("valu", (op3, tmp2_v, val_buf + i, v3)), force_alu=should_force_alu(i))
                             emit_loads()
                             for gi, i in enumerate(group):
                                 lane_base = gi * VLEN
                                 tmp1_v = tmp1_v_base + lane_base
                                 tmp2_v = tmp2_v_base + lane_base
-                                body.append(("valu", (op2, val_buf + i, tmp1_v, tmp2_v)))
+                                add_op(("valu", (op2, val_buf + i, tmp1_v, tmp2_v)), force_alu=should_force_alu(i))
                             emit_loads()
 
                 if self.enable_debug:
@@ -670,29 +692,31 @@ class KernelBuilder:
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
-                        body.append(("valu", ("&", tmp1_v, val_buf + i, one_v)))
+                        add_op(("valu", ("&", tmp1_v, val_buf + i, one_v)), force_alu=should_force_alu(i))
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
-                        body.append(("valu", ("+", idx_buf + i, tmp1_v, one_v)))
+                        add_op(("valu", ("+", idx_buf + i, tmp1_v, one_v)), force_alu=should_force_alu(i))
                     emit_loads()
                 else:
+                    # Generic case (depth > 0 and not last depth)
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
-                        body.append(("valu", ("&", tmp1_v, val_buf + i, one_v)))
+                        add_op(("valu", ("&", tmp1_v, val_buf + i, one_v)), force_alu=should_force_alu(i))
+                    emit_loads()
+                    # next_idx = (idx * 2) + (hashed_val & 1) + 1
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp1_v = tmp1_v_base + lane_base
+                        add_op(("valu", ("+", tmp1_v, tmp1_v, one_v)), force_alu=should_force_alu(i))
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
-                        body.append(("valu", ("+", tmp1_v, tmp1_v, one_v)))
-                    emit_loads()
-                    for gi, i in enumerate(group):
-                        lane_base = gi * VLEN
-                        tmp1_v = tmp1_v_base + lane_base
-                        body.append(
-                            ("valu", ("multiply_add", idx_buf + i, idx_buf + i, two_v, tmp1_v))
+                        add_op(
+                            ("valu", ("multiply_add", idx_buf + i, idx_buf + i, two_v, tmp1_v)), force_alu=False
                         )
                     emit_loads()
                 if self.enable_debug:
@@ -700,15 +724,9 @@ class KernelBuilder:
                         keys = [(round_i, i + lane, "next_idx") for lane in range(VLEN)]
                         body.append(("debug", ("vcompare", idx_buf + i, keys)))
                 if use_wrap:
+                    # Wrap case elimination: Simply broadcast zero to the index
                     for gi, i in enumerate(group):
-                        lane_base = gi * VLEN
-                        tmp2_v = tmp2_v_base + lane_base
-                        body.append(("valu", ("<", tmp2_v, idx_buf + i, n_nodes_v)))
-                    emit_loads()
-                    for gi, i in enumerate(group):
-                        lane_base = gi * VLEN
-                        tmp2_v = tmp2_v_base + lane_base
-                        body.append(("valu", ("*", idx_buf + i, idx_buf + i, tmp2_v)))
+                        add_op(("valu", ("vbroadcast", idx_buf + i, zero_const)), force_alu=False)
                     emit_loads()
                 if self.enable_debug:
                     for i in group:
@@ -717,7 +735,7 @@ class KernelBuilder:
 
                 if load_slots_next:
                     while load_idx[0] < len(load_slots_next):
-                        body.append(load_slots_next[load_idx[0]])
+                        add_op(load_slots_next[load_idx[0]])
                         load_idx[0] += 1
  
 
