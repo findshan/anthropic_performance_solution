@@ -128,8 +128,111 @@ class KernelBuilder:
                         reads.update(self._range_set(loc, VLEN))
         return reads, writes
 
+    def _schedule_segment(self, slots: list[tuple[Engine, tuple]]):
+        if not slots:
+            return []
+
+        reads = []
+        writes = []
+        succ = [[] for _ in range(len(slots))]
+        hard_indegree = [0] * len(slots)
+        war_preds = [set() for _ in range(len(slots))]
+        last_write = {}
+        last_read = {}
+
+        for idx, (engine, slot) in enumerate(slots):
+            rset, wset = self._slot_reads_writes(engine, slot)
+            reads.append(rset)
+            writes.append(wset)
+            deps = set()
+            for addr in rset:
+                if addr in last_write:
+                    deps.add(last_write[addr])
+            for addr in wset:
+                if addr in last_write:
+                    deps.add(last_write[addr])
+                if addr in last_read:
+                    war_preds[idx].add(last_read[addr])
+            for dep in deps:
+                succ[dep].append(idx)
+                hard_indegree[idx] += 1
+            for addr in rset:
+                last_read[addr] = idx
+            for addr in wset:
+                last_write[addr] = idx
+
+        slot_engines = [engine for engine, _slot in slots]
+        engine_priority = {
+            "load": 0,
+            "valu": 1,
+            "alu": 2,
+            "store": 3,
+            "flow": 4,
+            "debug": 5,
+        }
+        rank = [1] * len(slots)
+        for idx in range(len(slots) - 1, -1, -1):
+            if succ[idx]:
+                rank[idx] = 1 + max(rank[succ_idx] for succ_idx in succ[idx])
+        ready = [i for i, deg in enumerate(hard_indegree) if deg == 0]
+        ready.sort()
+        instrs = []
+        scheduled = 0
+        scheduled_set = set()
+
+        while scheduled < len(slots):
+            if not ready:
+                raise RuntimeError("Scheduler stalled: no ready slots.")
+
+            current = {}
+            engine_counts = defaultdict(int)
+            current_reads = set()
+            current_writes = set()
+            scheduled_in_cycle = []
+            available_war = set(scheduled_set)
+
+            ready.sort(key=lambda i: (engine_priority[slot_engines[i]], -rank[i], i))
+            for idx in ready:
+                engine, slot = slots[idx]
+                rset = reads[idx]
+                wset = writes[idx]
+                has_conflict = bool(wset & current_writes)
+                if engine_counts[engine] >= SLOT_LIMITS[engine] or has_conflict:
+                    continue
+                if not war_preds[idx].issubset(available_war):
+                    continue
+                if engine not in current:
+                    current[engine] = []
+                current[engine].append(slot)
+                engine_counts[engine] += 1
+                current_reads.update(rset)
+                current_writes.update(wset)
+                scheduled_in_cycle.append(idx)
+                available_war.add(idx)
+
+            if not scheduled_in_cycle:
+                idx = ready[0]
+                engine, slot = slots[idx]
+                current = {engine: [slot]}
+                scheduled_in_cycle = [idx]
+                available_war.add(idx)
+
+            instrs.append(current)
+            scheduled += len(scheduled_in_cycle)
+            scheduled_set.update(scheduled_in_cycle)
+
+            for idx in scheduled_in_cycle:
+                ready.remove(idx)
+                for succ_idx in succ[idx]:
+                    hard_indegree[succ_idx] -= 1
+                    if hard_indegree[succ_idx] == 0:
+                        ready.append(succ_idx)
+            ready.sort()
+
+        return instrs
+
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Greedy VLIW slot packing with conservative dependency avoidance.
+        # VLIW slot packing with conservative dependency avoidance.
         if not vliw:
             instrs = []
             for engine, slot in slots:
@@ -137,43 +240,15 @@ class KernelBuilder:
             return instrs
 
         instrs = []
-        current = {}
-        engine_counts = defaultdict(int)
-        current_reads = set()
-        current_writes = set()
-
-        def flush():
-            nonlocal current, engine_counts, current_reads, current_writes
-            if current:
-                instrs.append(current)
-            current = {}
-            engine_counts = defaultdict(int)
-            current_reads = set()
-            current_writes = set()
-
+        segment = []
         for engine, slot in slots:
             if engine == "debug":
-                flush()
+                instrs.extend(self._schedule_segment(segment))
+                segment = []
                 instrs.append({engine: [slot]})
                 continue
-
-            reads, writes = self._slot_reads_writes(engine, slot)
-            has_conflict = (
-                bool(reads & current_writes)
-                or bool(writes & current_reads)
-                or bool(writes & current_writes)
-            )
-            if engine_counts[engine] >= SLOT_LIMITS[engine] or has_conflict:
-                flush()
-
-            if engine not in current:
-                current[engine] = []
-            current[engine].append(slot)
-            engine_counts[engine] += 1
-            current_reads.update(reads)
-            current_writes.update(writes)
-
-        flush()
+            segment.append((engine, slot))
+        instrs.extend(self._schedule_segment(segment))
         return instrs
 
     def add(self, engine, slot):
@@ -251,26 +326,23 @@ class KernelBuilder:
         """
         # Scratch space addresses
         init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
+            ("n_nodes", 1),
+            ("forest_values_p", 4),
+            ("inp_values_p", 6),
         ]
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        for name, _idx in init_vars:
+            self.alloc_scratch(name, 1)
+        for name, idx in init_vars:
+            self.add("load", ("const", tmp1, idx))
+            self.add("load", ("load", self.scratch[name], tmp1))
 
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
+        three_const = self.scratch_const(3)
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
@@ -296,7 +368,7 @@ class KernelBuilder:
         tail_val = self.alloc_scratch("tail_val", tail_len if tail_len > 0 else 1)
 
         # Vector temps
-        pipe = 6
+        pipe = 13
         addr_v_base = self.alloc_scratch("addr_v", VLEN * pipe)
         node_v0_base = self.alloc_scratch("node_v0", VLEN * pipe)
         node_v1_base = self.alloc_scratch("node_v1", VLEN * pipe)
@@ -306,6 +378,7 @@ class KernelBuilder:
         zero_v = self.scratch_const_vector(0)
         one_v = self.scratch_const_vector(1)
         two_v = self.scratch_const_vector(2)
+        three_v = self.scratch_const_vector(3)
         n_nodes_v = self.vbroadcast_from(self.scratch["n_nodes"], "n_nodes_v")
         forest_base_v = self.vbroadcast_from(
             self.scratch["forest_values_p"], "forest_values_v"
@@ -329,6 +402,34 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", left_v, left_val))
         self.add("valu", ("vbroadcast", right_v, right_val))
         self.add("valu", ("-", left_minus_right_v, left_v, right_v))
+
+        # Preload depth-2 node values (indices 3..6) and deltas for depth==2 selection.
+        d2_node3 = self.alloc_scratch("d2_node3")
+        d2_node4 = self.alloc_scratch("d2_node4")
+        d2_node5 = self.alloc_scratch("d2_node5")
+        d2_node6 = self.alloc_scratch("d2_node6")
+        d2_node3_v = self.alloc_scratch("d2_node3_v", VLEN)
+        d2_node4_v = self.alloc_scratch("d2_node4_v", VLEN)
+        d2_node5_v = self.alloc_scratch("d2_node5_v", VLEN)
+        d2_node6_v = self.alloc_scratch("d2_node6_v", VLEN)
+        d2_delta34_v = self.alloc_scratch("d2_delta34_v", VLEN)
+        d2_delta56_v = self.alloc_scratch("d2_delta56_v", VLEN)
+
+        self.add("alu", ("+", tmp1, self.scratch["forest_values_p"], three_const))
+        self.add("load", ("load", d2_node3, tmp1))
+        self.add("alu", ("+", tmp1, tmp1, one_const))
+        self.add("load", ("load", d2_node4, tmp1))
+        self.add("alu", ("+", tmp1, tmp1, one_const))
+        self.add("load", ("load", d2_node5, tmp1))
+        self.add("alu", ("+", tmp1, tmp1, one_const))
+        self.add("load", ("load", d2_node6, tmp1))
+        self.add("valu", ("vbroadcast", d2_node3_v, d2_node3))
+        self.add("valu", ("vbroadcast", d2_node4_v, d2_node4))
+        self.add("valu", ("vbroadcast", d2_node5_v, d2_node5))
+        self.add("valu", ("vbroadcast", d2_node6_v, d2_node6))
+        self.add("valu", ("-", d2_delta34_v, d2_node4_v, d2_node3_v))
+        self.add("valu", ("-", d2_delta56_v, d2_node6_v, d2_node5_v))
+
 
         hash_plan = []
         for op1, val1, op2, op3, val3 in HASH_STAGES:
@@ -356,7 +457,6 @@ class KernelBuilder:
         # Initial load of idx/val into scratch buffers
         for i in range(0, vec_end, VLEN):
             i_const = self.scratch_const(i)
-            body.append(("valu", ("vbroadcast", idx_buf + i, zero_const)))
             body.append(
                 ("alu", ("+", tmp_val_addr, self.scratch["inp_values_p"], i_const))
             )
@@ -383,7 +483,8 @@ class KernelBuilder:
             depth = round_i % period
             use_root = depth == 0
             use_children = depth == 1
-            use_gather = not (use_root or use_children)
+            use_depth2 = depth == 2
+            use_gather = not (use_root or use_children or use_depth2)
             use_wrap = depth == forest_height
 
             for gi_group, group in enumerate(groups):
@@ -408,8 +509,11 @@ class KernelBuilder:
                         for gi, i in enumerate(group):
                             lane_base = gi * VLEN
                             addr_v = addr_v_base + lane_base
-                            node_v = cur_node_base + lane_base
                             body.append(("valu", ("+", addr_v, idx_buf + i, forest_base_v)))
+                        for gi, i in enumerate(group):
+                            lane_base = gi * VLEN
+                            addr_v = addr_v_base + lane_base
+                            node_v = cur_node_base + lane_base
                             for lane in range(VLEN):
                                 body.append(("load", ("load_offset", node_v, addr_v, lane)))
                     if next_group:
@@ -453,6 +557,72 @@ class KernelBuilder:
                                 "valu",
                                 ("multiply_add", node_v, tmp1_v, left_minus_right_v, right_v),
                             )
+                        )
+                    emit_loads()
+
+                if use_depth2:
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp1_v = tmp1_v_base + lane_base
+                        body.append(("valu", ("-", tmp1_v, idx_buf + i, three_v)))
+                    emit_loads()
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp1_v = tmp1_v_base + lane_base
+                        tmp2_v = tmp2_v_base + lane_base
+                        body.append(("valu", ("&", tmp2_v, tmp1_v, one_v)))
+                    emit_loads()
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp1_v = tmp1_v_base + lane_base
+                        body.append(("valu", (">>", tmp1_v, tmp1_v, one_v)))
+                    emit_loads()
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp2_v = tmp2_v_base + lane_base
+                        node_v = cur_node_base + lane_base
+                        body.append(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    node_v,
+                                    tmp2_v,
+                                    d2_delta34_v,
+                                    d2_node3_v,
+                                ),
+                            )
+                        )
+                    emit_loads()
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp2_v = tmp2_v_base + lane_base
+                        body.append(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    tmp2_v,
+                                    tmp2_v,
+                                    d2_delta56_v,
+                                    d2_node5_v,
+                                ),
+                            )
+                        )
+                    emit_loads()
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp2_v = tmp2_v_base + lane_base
+                        node_v = cur_node_base + lane_base
+                        body.append(("valu", ("-", tmp2_v, tmp2_v, node_v)))
+                    emit_loads()
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp1_v = tmp1_v_base + lane_base
+                        tmp2_v = tmp2_v_base + lane_base
+                        node_v = cur_node_base + lane_base
+                        body.append(
+                            ("valu", ("multiply_add", node_v, tmp1_v, tmp2_v, node_v))
                         )
                     emit_loads()
 
@@ -549,6 +719,7 @@ class KernelBuilder:
                     while load_idx[0] < len(load_slots_next):
                         body.append(load_slots_next[load_idx[0]])
                         load_idx[0] += 1
+ 
 
             # Scalar tail per round
             for ti in range(tail_len):
@@ -598,10 +769,6 @@ class KernelBuilder:
         for i in range(0, vec_end, VLEN):
             i_const = self.scratch_const(i)
             body.append(
-                ("alu", ("+", tmp_idx_addr, self.scratch["inp_indices_p"], i_const))
-            )
-            body.append(("store", ("vstore", tmp_idx_addr, idx_buf + i)))
-            body.append(
                 ("alu", ("+", tmp_val_addr, self.scratch["inp_values_p"], i_const))
             )
             body.append(("store", ("vstore", tmp_val_addr, val_buf + i)))
@@ -609,10 +776,6 @@ class KernelBuilder:
         # Store scalar tail
         for i in range(tail_len):
             i_const = self.scratch_const(vec_end + i)
-            body.append(
-                ("alu", ("+", tmp_idx_addr, self.scratch["inp_indices_p"], i_const))
-            )
-            body.append(("store", ("store", tmp_idx_addr, tail_idx + i)))
             body.append(
                 ("alu", ("+", tmp_val_addr, self.scratch["inp_values_p"], i_const))
             )
