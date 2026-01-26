@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented here.
 
+## [0.8] - Depth-aware wrap elimination pass
+- Skipped idx wrap checks on non-terminal depths; simplified depth-0 idx update.
+- Reduced valu ops from ~9780 to ~8756 and lowered cycles to 2423.
+- Test cycles: `tests/submission_tests.py` -> 2423 cycles.
+
 ## [0.7] - Grouped hash pipeline with overlapped gather
 - Grouped vector blocks into 6-way pipelines to pack VALU slots per stage and reduce bundle count.
 - Added round-depth specialization for depth 0/1 to avoid gather loads on root/first-level nodes.

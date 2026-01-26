@@ -384,6 +384,7 @@ class KernelBuilder:
             use_root = depth == 0
             use_children = depth == 1
             use_gather = not (use_root or use_children)
+            use_wrap = depth == forest_height
 
             for gi_group, group in enumerate(groups):
                 cur_node_base = node_v0_base if (gi_group % 2 == 0) else node_v1_base
@@ -495,37 +496,50 @@ class KernelBuilder:
                         keys = [(round_i, i + lane, "hashed_val") for lane in range(VLEN)]
                         body.append(("debug", ("vcompare", val_buf + i, keys)))
 
-                for gi, i in enumerate(group):
-                    lane_base = gi * VLEN
-                    tmp1_v = tmp1_v_base + lane_base
-                    body.append(("valu", ("&", tmp1_v, val_buf + i, one_v)))
-                emit_loads()
-                for gi, i in enumerate(group):
-                    lane_base = gi * VLEN
-                    tmp1_v = tmp1_v_base + lane_base
-                    body.append(("valu", ("+", tmp1_v, tmp1_v, one_v)))
-                emit_loads()
-                for gi, i in enumerate(group):
-                    lane_base = gi * VLEN
-                    tmp1_v = tmp1_v_base + lane_base
-                    body.append(
-                        ("valu", ("multiply_add", idx_buf + i, idx_buf + i, two_v, tmp1_v))
-                    )
-                emit_loads()
+                if use_root:
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp1_v = tmp1_v_base + lane_base
+                        body.append(("valu", ("&", tmp1_v, val_buf + i, one_v)))
+                    emit_loads()
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp1_v = tmp1_v_base + lane_base
+                        body.append(("valu", ("+", idx_buf + i, tmp1_v, one_v)))
+                    emit_loads()
+                else:
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp1_v = tmp1_v_base + lane_base
+                        body.append(("valu", ("&", tmp1_v, val_buf + i, one_v)))
+                    emit_loads()
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp1_v = tmp1_v_base + lane_base
+                        body.append(("valu", ("+", tmp1_v, tmp1_v, one_v)))
+                    emit_loads()
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp1_v = tmp1_v_base + lane_base
+                        body.append(
+                            ("valu", ("multiply_add", idx_buf + i, idx_buf + i, two_v, tmp1_v))
+                        )
+                    emit_loads()
                 if self.enable_debug:
                     for i in group:
                         keys = [(round_i, i + lane, "next_idx") for lane in range(VLEN)]
                         body.append(("debug", ("vcompare", idx_buf + i, keys)))
-                for gi, i in enumerate(group):
-                    lane_base = gi * VLEN
-                    tmp2_v = tmp2_v_base + lane_base
-                    body.append(("valu", ("<", tmp2_v, idx_buf + i, n_nodes_v)))
-                emit_loads()
-                for gi, i in enumerate(group):
-                    lane_base = gi * VLEN
-                    tmp2_v = tmp2_v_base + lane_base
-                    body.append(("valu", ("*", idx_buf + i, idx_buf + i, tmp2_v)))
-                emit_loads()
+                if use_wrap:
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp2_v = tmp2_v_base + lane_base
+                        body.append(("valu", ("<", tmp2_v, idx_buf + i, n_nodes_v)))
+                    emit_loads()
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp2_v = tmp2_v_base + lane_base
+                        body.append(("valu", ("*", idx_buf + i, idx_buf + i, tmp2_v)))
+                    emit_loads()
                 if self.enable_debug:
                     for i in group:
                         keys = [(round_i, i + lane, "wrapped_idx") for lane in range(VLEN)]
@@ -560,15 +574,21 @@ class KernelBuilder:
                         ("debug", ("compare", tail_val + ti, (round_i, vec_end + ti, "hashed_val")))
                     )
                 body.append(("alu", ("&", tmp1, tail_val + ti, one_const)))
-                body.append(("alu", ("+", tmp3, tmp1, one_const)))
-                body.append(("alu", ("*", tail_idx + ti, tail_idx + ti, two_const)))
-                body.append(("alu", ("+", tail_idx + ti, tail_idx + ti, tmp3)))
+                if use_root:
+                    body.append(("alu", ("+", tail_idx + ti, tmp1, one_const)))
+                else:
+                    body.append(("alu", ("+", tmp3, tmp1, one_const)))
+                    body.append(("alu", ("*", tail_idx + ti, tail_idx + ti, two_const)))
+                    body.append(("alu", ("+", tail_idx + ti, tail_idx + ti, tmp3)))
                 if self.enable_debug:
                     body.append(
                         ("debug", ("compare", tail_idx + ti, (round_i, vec_end + ti, "next_idx")))
                     )
-                body.append(("alu", ("<", tmp1, tail_idx + ti, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tail_idx + ti, tmp1, tail_idx + ti, zero_const)))
+                if use_wrap:
+                    body.append(("alu", ("<", tmp1, tail_idx + ti, self.scratch["n_nodes"])))
+                    body.append(
+                        ("flow", ("select", tail_idx + ti, tmp1, tail_idx + ti, zero_const))
+                    )
                 if self.enable_debug:
                     body.append(
                         ("debug", ("compare", tail_idx + ti, (round_i, vec_end + ti, "wrapped_idx")))
