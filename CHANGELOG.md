@@ -13,8 +13,9 @@ All notable changes to this project will be documented here.
 - **哈希链路优化**: 将 op2 的 ALU 旁路与 op1/op3 对齐（中等比例），进一步缓和 VALU 峰值。
 
 ## [2.5] - Flow vselect idx update
-- **性能变化**: `tests/submission_tests.py` 约 **1634 cycles**（`rounds=16, batch=256`），在保持正确性的前提下继续下降。
-- **索引更新压缩**: 使用 `flow vselect` 直接生成 `(val & 1) ? 2 : 1`，替代 `+1` 的 VALU 计算，降低 VALU 压力并提升 flow 利用率。
+- **性能变化**: `tests/submission_tests.py` 约 **1634 cycles**（`rounds=16, batch=256`），相对 2.4 的 **1660 cycles** 再降约 **26 cycles**，保持正确性。
+- **Slot 结构变化**: `trace_any.py` 显示 **VALU ≈ 8024**, **LOAD ≈ 2187**, **FLOW ≈ 450**；将 idx 更新中的 `+1` 计算改为 `flow vselect`，减少 VALU 峰值并让 FLOW 有效参与填槽。
+- **实现要点**: `offset = vselect(parity, two_v, one_v)` 后续仍走 `idx = idx * 2 + offset`，不改变数值语义。
 
 ## [2.4] - Prelude VLIW packing
 - **性能变化**: `tests/submission_tests.py` 约 **1660 cycles**（`rounds=16, batch=256`），进一步下降并保持正确性。
