@@ -191,16 +191,21 @@ class KernelBuilder:
             scheduled_in_cycle = []
             available_war = set(scheduled_set)
 
-            ready.sort(key=lambda i: (engine_priority[slot_engines[i]], -rank[i], i))
-            for idx in ready:
+            def can_schedule(idx):
+                engine = slot_engines[idx]
+                wset = writes[idx]
+                if engine_counts[engine] >= SLOT_LIMITS[engine]:
+                    return False
+                if wset & current_writes:
+                    return False
+                if not war_preds[idx].issubset(available_war):
+                    return False
+                return True
+
+            def do_schedule(idx):
                 engine, slot = slots[idx]
                 rset = reads[idx]
                 wset = writes[idx]
-                has_conflict = bool(wset & current_writes)
-                if engine_counts[engine] >= SLOT_LIMITS[engine] or has_conflict:
-                    continue
-                if not war_preds[idx].issubset(available_war):
-                    continue
                 if engine not in current:
                     current[engine] = []
                 current[engine].append(slot)
@@ -209,6 +214,61 @@ class KernelBuilder:
                 current_writes.update(wset)
                 scheduled_in_cycle.append(idx)
                 available_war.add(idx)
+
+            remaining = set(ready)
+            engines = [e for e in SLOT_LIMITS.keys() if e != "debug"]
+
+            progress = True
+            while progress and remaining:
+                progress = False
+                engine_order = sorted(
+                    engines,
+                    key=lambda e: (
+                        -sum(1 for idx in remaining if slot_engines[idx] == e)
+                        / SLOT_LIMITS[e],
+                        engine_priority[e],
+                    ),
+                )
+                for engine in engine_order:
+                    if engine_counts[engine] >= SLOT_LIMITS[engine]:
+                        continue
+                    while engine_counts[engine] < SLOT_LIMITS[engine]:
+                        candidates = [
+                            idx for idx in remaining if slot_engines[idx] == engine
+                        ]
+                        if not candidates:
+                            break
+                        candidates.sort(key=lambda i: (-rank[i], i))
+                        scheduled_one = False
+                        for idx in candidates:
+                            if not can_schedule(idx):
+                                continue
+                            do_schedule(idx)
+                            remaining.remove(idx)
+                            progress = True
+                            scheduled_one = True
+                            break
+                        if not scheduled_one:
+                            break
+
+            progress = True
+            while progress and remaining:
+                progress = False
+                order = sorted(
+                    remaining,
+                    key=lambda i: (
+                        engine_counts[slot_engines[i]] / SLOT_LIMITS[slot_engines[i]],
+                        -rank[i],
+                        engine_priority[slot_engines[i]],
+                        i,
+                    ),
+                )
+                for idx in order:
+                    if not can_schedule(idx):
+                        continue
+                    do_schedule(idx)
+                    remaining.remove(idx)
+                    progress = True
 
             if not scheduled_in_cycle:
                 idx = ready[0]
@@ -317,32 +377,35 @@ class KernelBuilder:
 
         return slots
 
-    def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
-    ):
-        """
-        Vector-first kernel with scratch-resident idx/val, hashed across rounds,
-        then written back once at the end. Scalar tail handled separately.
-        """
+    def build_kernel(self, forest_height, n_nodes, batch_size, rounds):
+        # Setup scratch space
         # Scratch space addresses
         init_vars = [
+            ("forest_height", 0),
             ("n_nodes", 1),
+            ("batch_size", 2),
+            ("rounds", 3),
             ("forest_values_p", 4),
+            ("inp_indices_p", 5),
             ("inp_values_p", 6),
         ]
+        
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
+        
         for name, _idx in init_vars:
-            self.alloc_scratch(name, 1)
+             self.scratch[name] = self.alloc_scratch(name)
+             
+        # Preload constants
         for name, idx in init_vars:
             self.add("load", ("const", tmp1, idx))
             self.add("load", ("load", self.scratch[name], tmp1))
 
-        zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
         three_const = self.scratch_const(3)
+        zero_const = self.scratch_const(0)
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
@@ -412,8 +475,6 @@ class KernelBuilder:
         d2_node4_v = self.alloc_scratch("d2_node4_v", VLEN)
         d2_node5_v = self.alloc_scratch("d2_node5_v", VLEN)
         d2_node6_v = self.alloc_scratch("d2_node6_v", VLEN)
-        d2_delta34_v = self.alloc_scratch("d2_delta34_v", VLEN)
-        d2_delta56_v = self.alloc_scratch("d2_delta56_v", VLEN)
 
         self.add("alu", ("+", tmp1, self.scratch["forest_values_p"], three_const))
         self.add("load", ("load", d2_node3, tmp1))
@@ -427,8 +488,58 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", d2_node4_v, d2_node4))
         self.add("valu", ("vbroadcast", d2_node5_v, d2_node5))
         self.add("valu", ("vbroadcast", d2_node6_v, d2_node6))
+
+        d2_delta34_v = self.alloc_scratch("d2_delta34_v", VLEN)
+        d2_delta56_v = self.alloc_scratch("d2_delta56_v", VLEN)
         self.add("valu", ("-", d2_delta34_v, d2_node4_v, d2_node3_v))
         self.add("valu", ("-", d2_delta56_v, d2_node6_v, d2_node5_v))
+
+        enable_depth3_mux = True
+        enable_depth4_mux = False
+        has_depth3 = enable_depth3_mux and forest_height >= 3
+        has_depth4 = enable_depth4_mux and forest_height >= 4
+        d3_nodes_v = None
+        d4_nodes_v = None
+        seven_v = None
+        fifteen_v = None
+        d3_delta01_v = None
+        d3_delta23_v = None
+        d3_delta45_v = None
+        d3_delta67_v = None
+
+        if has_depth3:
+            seven_const = self.scratch_const(7)
+            seven_v = self.scratch_const_vector(7)
+            d3_nodes_v = []
+            self.add("alu", ("+", tmp1, self.scratch["forest_values_p"], seven_const))
+            for idx in range(7, 15):
+                vec_addr = self.alloc_scratch(f"d3_node{idx}_v", VLEN)
+                d3_nodes_v.append(vec_addr)
+                self.add("load", ("load", tmp2, tmp1))
+                self.add("valu", ("vbroadcast", vec_addr, tmp2))
+                if idx != 14:
+                    self.add("alu", ("+", tmp1, tmp1, one_const))
+            d3_delta01_v = self.alloc_scratch("d3_delta01_v", VLEN)
+            d3_delta23_v = self.alloc_scratch("d3_delta23_v", VLEN)
+            d3_delta45_v = self.alloc_scratch("d3_delta45_v", VLEN)
+            d3_delta67_v = self.alloc_scratch("d3_delta67_v", VLEN)
+            self.add("valu", ("-", d3_delta01_v, d3_nodes_v[1], d3_nodes_v[0]))
+            self.add("valu", ("-", d3_delta23_v, d3_nodes_v[3], d3_nodes_v[2]))
+            self.add("valu", ("-", d3_delta45_v, d3_nodes_v[5], d3_nodes_v[4]))
+            self.add("valu", ("-", d3_delta67_v, d3_nodes_v[7], d3_nodes_v[6]))
+
+        if has_depth4:
+            fifteen_const = self.scratch_const(15)
+            fifteen_v = self.scratch_const_vector(15)
+            d4_nodes_v = []
+            self.add("alu", ("+", tmp1, self.scratch["forest_values_p"], fifteen_const))
+            for idx in range(15, 31):
+                vec_addr = self.alloc_scratch(f"d4_node{idx}_v", VLEN)
+                d4_nodes_v.append(vec_addr)
+                self.add("load", ("load", tmp2, tmp1))
+                self.add("valu", ("vbroadcast", vec_addr, tmp2))
+                if idx != 30:
+                    self.add("alu", ("+", tmp1, tmp1, one_const))
 
 
         hash_plan = []
@@ -458,6 +569,10 @@ class KernelBuilder:
         for i in range(0, vec_end, VLEN):
             i_const = self.scratch_const(i)
             body.append(
+                ("alu", ("+", tmp_idx_addr, self.scratch["inp_indices_p"], i_const))
+            )
+            body.append(("load", ("vload", idx_buf + i, tmp_idx_addr)))
+            body.append(
                 ("alu", ("+", tmp_val_addr, self.scratch["inp_values_p"], i_const))
             )
             body.append(("load", ("vload", val_buf + i, tmp_val_addr)))
@@ -484,8 +599,14 @@ class KernelBuilder:
             use_root = depth == 0
             use_children = depth == 1
             use_depth2 = depth == 2
-            use_gather = not (use_root or use_children or use_depth2)
+            use_depth3 = has_depth3 and depth == 3
+            use_depth4 = has_depth4 and depth == 4
+            use_gather = not (
+                use_root or use_children or use_depth2 or use_depth3 or use_depth4
+            )
             use_wrap = depth == forest_height
+            last_round = round_i == rounds - 1
+            skip_idx_update = (not self.enable_debug) and (use_wrap or last_round)
 
             for gi_group, group in enumerate(groups):
                 cur_node_base = node_v0_base if (gi_group % 2 == 0) else node_v1_base
@@ -495,6 +616,32 @@ class KernelBuilder:
                     if use_gather and gi_group + 1 < len(groups)
                     else None
                 )
+
+                # Helper to decide if we should scalarize a specific vector index
+                def should_force_alu(i):
+                    # Experiment with this condition. 
+                    # i % 5 == 4 targets 20%. (Optimal found: 1692 cycles)
+                    return (i % 5 == 4)
+
+                def should_force_alu_hash(i, stage):
+                    # Moderate ratio to ease VALU pressure on hash stages.
+                    return ((i + stage) % 5 == 4)
+
+                def add_op(inst, force_alu=False):
+                    type, args = inst
+                    # Intercept VALU ops if force_alu is requested
+                    if force_alu and type == "valu":
+                        op = args[0]
+                        # Supported ALU ops
+                        if op in ["+", "-", "&", "^", "|", "<<", ">>", "*", "<"]: 
+                            # Unroll 8 lanes
+                            for lane in range(VLEN):
+                                lane_args = [op]
+                                for arg in args[1:]:
+                                    lane_args.append(arg + lane)
+                                body.append(("alu", tuple(lane_args)))
+                            return
+                    body.append((type, args))
 
                 if self.enable_debug:
                     for i in group:
@@ -509,18 +656,18 @@ class KernelBuilder:
                         for gi, i in enumerate(group):
                             lane_base = gi * VLEN
                             addr_v = addr_v_base + lane_base
-                            body.append(("valu", ("+", addr_v, idx_buf + i, forest_base_v)))
+                            add_op(("valu", ("+", addr_v, idx_buf + i, forest_base_v)), force_alu=should_force_alu(i))
                         for gi, i in enumerate(group):
                             lane_base = gi * VLEN
                             addr_v = addr_v_base + lane_base
                             node_v = cur_node_base + lane_base
                             for lane in range(VLEN):
-                                body.append(("load", ("load_offset", node_v, addr_v, lane)))
+                                add_op(("load", ("load_offset", node_v, addr_v, lane)))
                     if next_group:
                         for gi, i in enumerate(next_group):
                             lane_base = gi * VLEN
                             addr_v = addr_v_base + lane_base
-                            body.append(("valu", ("+", addr_v, idx_buf + i, forest_base_v)))
+                            add_op(("valu", ("+", addr_v, idx_buf + i, forest_base_v)), force_alu=should_force_alu(i))
                         for gi, i in enumerate(next_group):
                             lane_base = gi * VLEN
                             addr_v = addr_v_base + lane_base
@@ -531,7 +678,7 @@ class KernelBuilder:
                                 )
 
                 load_idx = [0]
-                load_per_point = 2 if load_slots_next else 0
+                load_per_point = 3 if load_slots_next else 0
 
                 def emit_loads():
                     if load_per_point == 0:
@@ -539,24 +686,24 @@ class KernelBuilder:
                     for _ in range(load_per_point):
                         if load_idx[0] >= len(load_slots_next):
                             break
-                        body.append(load_slots_next[load_idx[0]])
+                        add_op(load_slots_next[load_idx[0]])
                         load_idx[0] += 1
 
                 if use_children:
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
-                        body.append(("valu", ("&", tmp1_v, idx_buf + i, one_v)))
+                        add_op(("valu", ("&", tmp1_v, idx_buf + i, one_v)), force_alu=should_force_alu(i))
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
                         node_v = cur_node_base + lane_base
-                        body.append(
+                        add_op(
                             (
                                 "valu",
                                 ("multiply_add", node_v, tmp1_v, left_minus_right_v, right_v),
-                            )
+                            ), force_alu=False
                         )
                     emit_loads()
 
@@ -564,24 +711,24 @@ class KernelBuilder:
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
-                        body.append(("valu", ("-", tmp1_v, idx_buf + i, three_v)))
+                        add_op(("valu", ("-", tmp1_v, idx_buf + i, three_v)), force_alu=should_force_alu(i))
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
                         tmp2_v = tmp2_v_base + lane_base
-                        body.append(("valu", ("&", tmp2_v, tmp1_v, one_v)))
+                        add_op(("valu", ("&", tmp2_v, tmp1_v, one_v)), force_alu=should_force_alu(i))
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
-                        body.append(("valu", (">>", tmp1_v, tmp1_v, one_v)))
+                        add_op(("valu", (">>", tmp1_v, tmp1_v, one_v)), force_alu=should_force_alu(i))
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp2_v = tmp2_v_base + lane_base
                         node_v = cur_node_base + lane_base
-                        body.append(
+                        add_op(
                             (
                                 "valu",
                                 (
@@ -591,13 +738,13 @@ class KernelBuilder:
                                     d2_delta34_v,
                                     d2_node3_v,
                                 ),
-                            )
+                            ), force_alu=False
                         )
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp2_v = tmp2_v_base + lane_base
-                        body.append(
+                        add_op(
                             (
                                 "valu",
                                 (
@@ -607,58 +754,508 @@ class KernelBuilder:
                                     d2_delta56_v,
                                     d2_node5_v,
                                 ),
-                            )
+                            ), force_alu=False
                         )
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp2_v = tmp2_v_base + lane_base
                         node_v = cur_node_base + lane_base
-                        body.append(("valu", ("-", tmp2_v, tmp2_v, node_v)))
+                        add_op(("valu", ("-", tmp2_v, tmp2_v, node_v)), force_alu=should_force_alu(i))
                     emit_loads()
                     for gi, i in enumerate(group):
                         lane_base = gi * VLEN
                         tmp1_v = tmp1_v_base + lane_base
                         tmp2_v = tmp2_v_base + lane_base
                         node_v = cur_node_base + lane_base
-                        body.append(
-                            ("valu", ("multiply_add", node_v, tmp1_v, tmp2_v, node_v))
+                        add_op(
+                            ("valu", ("multiply_add", node_v, tmp1_v, tmp2_v, node_v)), force_alu=False
                         )
                     emit_loads()
+
+                if use_depth3:
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp1_v = tmp1_v_base + lane_base
+                        tmp2_v = tmp2_v_base + lane_base
+                        b1_v = addr_v_base + lane_base
+                        node_v = cur_node_base + lane_base
+                        aux_v = next_node_base + lane_base
+                        add_op(("valu", ("-", tmp1_v, idx_buf + i, seven_v)), force_alu=should_force_alu(i))
+                        add_op(("valu", ("&", tmp2_v, tmp1_v, one_v)), force_alu=should_force_alu(i))
+                        add_op(("valu", (">>", tmp1_v, tmp1_v, one_v)), force_alu=should_force_alu(i))
+                        add_op(("valu", ("&", b1_v, tmp1_v, one_v)), force_alu=should_force_alu(i))
+                        add_op(("valu", (">>", tmp1_v, tmp1_v, one_v)), force_alu=should_force_alu(i))
+
+                        add_op(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    node_v,
+                                    tmp2_v,
+                                    d3_delta01_v,
+                                    d3_nodes_v[0],
+                                ),
+                            ),
+                            force_alu=False,
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    aux_v,
+                                    tmp2_v,
+                                    d3_delta23_v,
+                                    d3_nodes_v[2],
+                                ),
+                            ),
+                            force_alu=False,
+                        )
+                        add_op(("valu", ("-", aux_v, aux_v, node_v)), force_alu=should_force_alu(i))
+                        add_op(
+                            (
+                                "valu",
+                                ("multiply_add", node_v, b1_v, aux_v, node_v),
+                            ),
+                            force_alu=False,
+                        )
+
+                        add_op(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    aux_v,
+                                    tmp2_v,
+                                    d3_delta45_v,
+                                    d3_nodes_v[4],
+                                ),
+                            ),
+                            force_alu=False,
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    tmp2_v,
+                                    tmp2_v,
+                                    d3_delta67_v,
+                                    d3_nodes_v[6],
+                                ),
+                            ),
+                            force_alu=False,
+                        )
+                        add_op(("valu", ("-", tmp2_v, tmp2_v, aux_v)), force_alu=should_force_alu(i))
+                        add_op(
+                            (
+                                "valu",
+                                ("multiply_add", aux_v, b1_v, tmp2_v, aux_v),
+                            ),
+                            force_alu=False,
+                        )
+
+                        add_op(("valu", ("-", aux_v, aux_v, node_v)), force_alu=should_force_alu(i))
+                        add_op(
+                            (
+                                "valu",
+                                ("multiply_add", node_v, tmp1_v, aux_v, node_v),
+                            ),
+                            force_alu=False,
+                        )
+
+                if use_depth4:
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        tmp1_v = tmp1_v_base + lane_base
+                        tmp2_v = tmp2_v_base + lane_base
+                        addr_v = addr_v_base + lane_base
+                        node_v = cur_node_base + lane_base
+                        aux_v = next_node_base + lane_base
+
+                        # b0 = (idx - 15) & 1
+                        add_op(
+                            ("valu", ("-", tmp1_v, idx_buf + i, fifteen_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            ("valu", ("&", tmp2_v, tmp1_v, one_v)),
+                            force_alu=should_force_alu(i),
+                        )
+
+                        # v0_1 -> node_v
+                        add_op(
+                            ("valu", ("-", node_v, d4_nodes_v[1], d4_nodes_v[0])),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    node_v,
+                                    tmp2_v,
+                                    node_v,
+                                    d4_nodes_v[0],
+                                ),
+                            ),
+                            force_alu=False,
+                        )
+                        # v2_3 -> aux_v
+                        add_op(
+                            ("valu", ("-", aux_v, d4_nodes_v[3], d4_nodes_v[2])),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    aux_v,
+                                    tmp2_v,
+                                    aux_v,
+                                    d4_nodes_v[2],
+                                ),
+                            ),
+                            force_alu=False,
+                        )
+
+                        # b1 = ((idx - 15) >> 1) & 1
+                        add_op(
+                            ("valu", ("-", tmp1_v, idx_buf + i, fifteen_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            ("valu", (">>", tmp1_v, tmp1_v, one_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            ("valu", ("&", addr_v, tmp1_v, one_v)),
+                            force_alu=should_force_alu(i),
+                        )
+
+                        # v0_3 -> node_v
+                        add_op(
+                            ("valu", ("-", aux_v, aux_v, node_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                ("multiply_add", node_v, addr_v, aux_v, node_v),
+                            ),
+                            force_alu=False,
+                        )
+
+                        # v4_5 -> aux_v
+                        add_op(
+                            ("valu", ("-", aux_v, d4_nodes_v[5], d4_nodes_v[4])),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    aux_v,
+                                    tmp2_v,
+                                    aux_v,
+                                    d4_nodes_v[4],
+                                ),
+                            ),
+                            force_alu=False,
+                        )
+                        # v6_7 -> tmp1_v
+                        add_op(
+                            ("valu", ("-", tmp1_v, d4_nodes_v[7], d4_nodes_v[6])),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    tmp1_v,
+                                    tmp2_v,
+                                    tmp1_v,
+                                    d4_nodes_v[6],
+                                ),
+                            ),
+                            force_alu=False,
+                        )
+
+                        # v4_7 -> aux_v
+                        add_op(
+                            ("valu", ("-", tmp1_v, tmp1_v, aux_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                ("multiply_add", aux_v, addr_v, tmp1_v, aux_v),
+                            ),
+                            force_alu=False,
+                        )
+
+                        # b2 = ((idx - 15) >> 2) & 1
+                        add_op(
+                            ("valu", ("-", tmp1_v, idx_buf + i, fifteen_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            ("valu", (">>", tmp1_v, tmp1_v, two_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            ("valu", ("&", tmp1_v, tmp1_v, one_v)),
+                            force_alu=should_force_alu(i),
+                        )
+
+                        # v0_7 -> node_v
+                        add_op(
+                            ("valu", ("-", aux_v, aux_v, node_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                ("multiply_add", node_v, tmp1_v, aux_v, node_v),
+                            ),
+                            force_alu=False,
+                        )
+
+                        # v8_9 -> aux_v
+                        add_op(
+                            ("valu", ("-", aux_v, d4_nodes_v[9], d4_nodes_v[8])),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    aux_v,
+                                    tmp2_v,
+                                    aux_v,
+                                    d4_nodes_v[8],
+                                ),
+                            ),
+                            force_alu=False,
+                        )
+                        # v10_11 -> tmp1_v
+                        add_op(
+                            ("valu", ("-", tmp1_v, d4_nodes_v[11], d4_nodes_v[10])),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    tmp1_v,
+                                    tmp2_v,
+                                    tmp1_v,
+                                    d4_nodes_v[10],
+                                ),
+                            ),
+                            force_alu=False,
+                        )
+
+                        # b1 recompute
+                        add_op(
+                            ("valu", ("-", addr_v, idx_buf + i, fifteen_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            ("valu", (">>", addr_v, addr_v, one_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            ("valu", ("&", addr_v, addr_v, one_v)),
+                            force_alu=should_force_alu(i),
+                        )
+
+                        # v8_11 -> aux_v
+                        add_op(
+                            ("valu", ("-", tmp1_v, tmp1_v, aux_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                ("multiply_add", aux_v, addr_v, tmp1_v, aux_v),
+                            ),
+                            force_alu=False,
+                        )
+
+                        # v12_13 -> tmp1_v
+                        add_op(
+                            ("valu", ("-", tmp1_v, d4_nodes_v[13], d4_nodes_v[12])),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    tmp1_v,
+                                    tmp2_v,
+                                    tmp1_v,
+                                    d4_nodes_v[12],
+                                ),
+                            ),
+                            force_alu=False,
+                        )
+                        # v14_15 -> addr_v
+                        add_op(
+                            ("valu", ("-", addr_v, d4_nodes_v[15], d4_nodes_v[14])),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                (
+                                    "multiply_add",
+                                    addr_v,
+                                    tmp2_v,
+                                    addr_v,
+                                    d4_nodes_v[14],
+                                ),
+                            ),
+                            force_alu=False,
+                        )
+
+                        # b1 recompute for v12_15
+                        add_op(
+                            ("valu", ("-", tmp2_v, idx_buf + i, fifteen_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            ("valu", (">>", tmp2_v, tmp2_v, one_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            ("valu", ("&", tmp2_v, tmp2_v, one_v)),
+                            force_alu=should_force_alu(i),
+                        )
+
+                        # v12_15 -> tmp1_v
+                        add_op(
+                            ("valu", ("-", addr_v, addr_v, tmp1_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                ("multiply_add", tmp1_v, tmp2_v, addr_v, tmp1_v),
+                            ),
+                            force_alu=False,
+                        )
+
+                        # b2 recompute for v8_15
+                        add_op(
+                            ("valu", ("-", tmp2_v, idx_buf + i, fifteen_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            ("valu", (">>", tmp2_v, tmp2_v, two_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            ("valu", ("&", tmp2_v, tmp2_v, one_v)),
+                            force_alu=should_force_alu(i),
+                        )
+
+                        # v8_15 -> aux_v
+                        add_op(
+                            ("valu", ("-", tmp1_v, tmp1_v, aux_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                ("multiply_add", aux_v, tmp2_v, tmp1_v, aux_v),
+                            ),
+                            force_alu=False,
+                        )
+
+                        # b3 = ((idx - 15) >> 3) & 1
+                        add_op(
+                            ("valu", ("-", tmp1_v, idx_buf + i, fifteen_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            ("valu", (">>", tmp1_v, tmp1_v, three_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            ("valu", ("&", tmp1_v, tmp1_v, one_v)),
+                            force_alu=should_force_alu(i),
+                        )
+
+                        # final select
+                        add_op(
+                            ("valu", ("-", aux_v, aux_v, node_v)),
+                            force_alu=should_force_alu(i),
+                        )
+                        add_op(
+                            (
+                                "valu",
+                                ("multiply_add", node_v, tmp1_v, aux_v, node_v),
+                            ),
+                            force_alu=False,
+                        )
+
+                if self.enable_debug:
+                    for gi, i in enumerate(group):
+                        lane_base = gi * VLEN
+                        node_src = root_v if use_root else cur_node_base + lane_base
+                        keys = [
+                            (round_i, i + lane, "node_val") for lane in range(VLEN)
+                        ]
+                        body.append(("debug", ("vcompare", node_src, keys)))
 
                 for gi, i in enumerate(group):
                     lane_base = gi * VLEN
                     node_src = root_v if use_root else cur_node_base + lane_base
-                    body.append(("valu", ("^", val_buf + i, val_buf + i, node_src)))
+                    add_op(("valu", ("^", val_buf + i, val_buf + i, node_src)), force_alu=should_force_alu(i))
                 emit_loads()
 
                 for hi, plan in enumerate(hash_plan):
                     match plan:
                         case ("fused_add", factor_v, v1):
                             for gi, i in enumerate(group):
-                                body.append(
+                                add_op(
                                     (
                                         "valu",
                                         ("multiply_add", val_buf + i, val_buf + i, factor_v, v1),
-                                    )
+                                    ), force_alu=False
                                 )
                             emit_loads()
                         case ("generic", v1, v3, op1, op2, op3):
                             for gi, i in enumerate(group):
                                 lane_base = gi * VLEN
-                                tmp1_v = tmp1_v_base + lane_base
-                                body.append(("valu", (op1, tmp1_v, val_buf + i, v1)))
+                                tmp2_v = tmp2_v_base + lane_base
+                                add_op(
+                                    ("valu", (op3, tmp2_v, val_buf + i, v3)),
+                                    force_alu=should_force_alu_hash(i, hi),
+                                )
+                            emit_loads()
+                            for gi, i in enumerate(group):
+                                add_op(
+                                    ("valu", (op1, val_buf + i, val_buf + i, v1)),
+                                    force_alu=should_force_alu_hash(i, hi),
+                                )
                             emit_loads()
                             for gi, i in enumerate(group):
                                 lane_base = gi * VLEN
                                 tmp2_v = tmp2_v_base + lane_base
-                                body.append(("valu", (op3, tmp2_v, val_buf + i, v3)))
-                            emit_loads()
-                            for gi, i in enumerate(group):
-                                lane_base = gi * VLEN
-                                tmp1_v = tmp1_v_base + lane_base
-                                tmp2_v = tmp2_v_base + lane_base
-                                body.append(("valu", (op2, val_buf + i, tmp1_v, tmp2_v)))
+                                add_op(
+                                    ("valu", (op2, val_buf + i, val_buf + i, tmp2_v)),
+                                    force_alu=should_force_alu_hash(i, hi),
+                                )
                             emit_loads()
 
                 if self.enable_debug:
@@ -666,58 +1263,69 @@ class KernelBuilder:
                         keys = [(round_i, i + lane, "hashed_val") for lane in range(VLEN)]
                         body.append(("debug", ("vcompare", val_buf + i, keys)))
 
-                if use_root:
-                    for gi, i in enumerate(group):
-                        lane_base = gi * VLEN
-                        tmp1_v = tmp1_v_base + lane_base
-                        body.append(("valu", ("&", tmp1_v, val_buf + i, one_v)))
-                    emit_loads()
-                    for gi, i in enumerate(group):
-                        lane_base = gi * VLEN
-                        tmp1_v = tmp1_v_base + lane_base
-                        body.append(("valu", ("+", idx_buf + i, tmp1_v, one_v)))
-                    emit_loads()
-                else:
-                    for gi, i in enumerate(group):
-                        lane_base = gi * VLEN
-                        tmp1_v = tmp1_v_base + lane_base
-                        body.append(("valu", ("&", tmp1_v, val_buf + i, one_v)))
-                    emit_loads()
-                    for gi, i in enumerate(group):
-                        lane_base = gi * VLEN
-                        tmp1_v = tmp1_v_base + lane_base
-                        body.append(("valu", ("+", tmp1_v, tmp1_v, one_v)))
-                    emit_loads()
-                    for gi, i in enumerate(group):
-                        lane_base = gi * VLEN
-                        tmp1_v = tmp1_v_base + lane_base
-                        body.append(
-                            ("valu", ("multiply_add", idx_buf + i, idx_buf + i, two_v, tmp1_v))
-                        )
-                    emit_loads()
-                if self.enable_debug:
-                    for i in group:
-                        keys = [(round_i, i + lane, "next_idx") for lane in range(VLEN)]
-                        body.append(("debug", ("vcompare", idx_buf + i, keys)))
-                if use_wrap:
-                    for gi, i in enumerate(group):
-                        lane_base = gi * VLEN
-                        tmp2_v = tmp2_v_base + lane_base
-                        body.append(("valu", ("<", tmp2_v, idx_buf + i, n_nodes_v)))
-                    emit_loads()
-                    for gi, i in enumerate(group):
-                        lane_base = gi * VLEN
-                        tmp2_v = tmp2_v_base + lane_base
-                        body.append(("valu", ("*", idx_buf + i, idx_buf + i, tmp2_v)))
-                    emit_loads()
-                if self.enable_debug:
-                    for i in group:
-                        keys = [(round_i, i + lane, "wrapped_idx") for lane in range(VLEN)]
-                        body.append(("debug", ("vcompare", idx_buf + i, keys)))
+                if not skip_idx_update:
+                    if use_root:
+                        for gi, i in enumerate(group):
+                            lane_base = gi * VLEN
+                            tmp1_v = tmp1_v_base + lane_base
+                            add_op(
+                                ("valu", ("&", tmp1_v, val_buf + i, one_v)),
+                                force_alu=should_force_alu(i),
+                            )
+                        emit_loads()
+                        for gi, i in enumerate(group):
+                            lane_base = gi * VLEN
+                            tmp1_v = tmp1_v_base + lane_base
+                            body.append(
+                                ("flow", ("vselect", idx_buf + i, tmp1_v, two_v, one_v))
+                            )
+                        emit_loads()
+                    elif use_wrap:
+                        # Wrap case elimination: Simply broadcast zero to the index
+                        for gi, i in enumerate(group):
+                            add_op(("valu", ("vbroadcast", idx_buf + i, zero_const)), force_alu=False)
+                        emit_loads()
+                    else:
+                        # Generic case (depth > 0 and not last depth)
+                        for gi, i in enumerate(group):
+                            lane_base = gi * VLEN
+                            tmp1_v = tmp1_v_base + lane_base
+                            add_op(
+                                ("valu", ("&", tmp1_v, val_buf + i, one_v)),
+                                force_alu=should_force_alu(i),
+                            )
+                        emit_loads()
+                        # next_idx = (idx * 2) + (hashed_val & 1) + 1
+                        for gi, i in enumerate(group):
+                            lane_base = gi * VLEN
+                            tmp1_v = tmp1_v_base + lane_base
+                            body.append(
+                                ("flow", ("vselect", tmp1_v, tmp1_v, two_v, one_v))
+                            )
+                        emit_loads()
+                        for gi, i in enumerate(group):
+                            lane_base = gi * VLEN
+                            tmp1_v = tmp1_v_base + lane_base
+                            add_op(
+                                (
+                                    "valu",
+                                    ("multiply_add", idx_buf + i, idx_buf + i, two_v, tmp1_v),
+                                ),
+                                force_alu=False,
+                            )
+                        emit_loads()
+                    if self.enable_debug:
+                        for i in group:
+                            keys = [(round_i, i + lane, "next_idx") for lane in range(VLEN)]
+                            body.append(("debug", ("vcompare", idx_buf + i, keys)))
+                    if self.enable_debug and use_wrap:
+                        for i in group:
+                            keys = [(round_i, i + lane, "wrapped_idx") for lane in range(VLEN)]
+                            body.append(("debug", ("vcompare", idx_buf + i, keys)))
 
                 if load_slots_next:
                     while load_idx[0] < len(load_slots_next):
-                        body.append(load_slots_next[load_idx[0]])
+                        add_op(load_slots_next[load_idx[0]])
                         load_idx[0] += 1
  
 
@@ -744,26 +1352,39 @@ class KernelBuilder:
                     body.append(
                         ("debug", ("compare", tail_val + ti, (round_i, vec_end + ti, "hashed_val")))
                     )
-                body.append(("alu", ("&", tmp1, tail_val + ti, one_const)))
-                if use_root:
-                    body.append(("alu", ("+", tail_idx + ti, tmp1, one_const)))
-                else:
-                    body.append(("alu", ("+", tmp3, tmp1, one_const)))
-                    body.append(("alu", ("*", tail_idx + ti, tail_idx + ti, two_const)))
-                    body.append(("alu", ("+", tail_idx + ti, tail_idx + ti, tmp3)))
-                if self.enable_debug:
-                    body.append(
-                        ("debug", ("compare", tail_idx + ti, (round_i, vec_end + ti, "next_idx")))
-                    )
-                if use_wrap:
-                    body.append(("alu", ("<", tmp1, tail_idx + ti, self.scratch["n_nodes"])))
-                    body.append(
-                        ("flow", ("select", tail_idx + ti, tmp1, tail_idx + ti, zero_const))
-                    )
-                if self.enable_debug:
-                    body.append(
-                        ("debug", ("compare", tail_idx + ti, (round_i, vec_end + ti, "wrapped_idx")))
-                    )
+                if not skip_idx_update:
+                    body.append(("alu", ("&", tmp1, tail_val + ti, one_const)))
+                    if use_root:
+                        body.append(("alu", ("+", tail_idx + ti, tmp1, one_const)))
+                    else:
+                        body.append(("alu", ("+", tmp3, tmp1, one_const)))
+                        body.append(("alu", ("*", tail_idx + ti, tail_idx + ti, two_const)))
+                        body.append(("alu", ("+", tail_idx + ti, tail_idx + ti, tmp3)))
+                    if self.enable_debug:
+                        body.append(
+                            (
+                                "debug",
+                                ("compare", tail_idx + ti, (round_i, vec_end + ti, "next_idx")),
+                            )
+                        )
+                    if use_wrap:
+                        body.append(
+                            ("alu", ("<", tmp1, tail_idx + ti, self.scratch["n_nodes"]))
+                        )
+                        body.append(
+                            ("flow", ("select", tail_idx + ti, tmp1, tail_idx + ti, zero_const))
+                        )
+                    if self.enable_debug:
+                        body.append(
+                            (
+                                "debug",
+                                (
+                                    "compare",
+                                    tail_idx + ti,
+                                    (round_i, vec_end + ti, "wrapped_idx"),
+                                ),
+                            )
+                        )
 
         # Store back final vectors
         for i in range(0, vec_end, VLEN):
@@ -786,6 +1407,25 @@ class KernelBuilder:
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
+        # Pack the prelude to improve early-cycle utilization.
+        pause_idx = None
+        for i, inst in enumerate(self.instrs):
+            if inst.get("flow") == [("pause",)]:
+                pause_idx = i
+                break
+        if pause_idx is not None and pause_idx > 0:
+            prelude_slots = []
+            for inst in self.instrs[:pause_idx]:
+                for engine, slots in inst.items():
+                    for slot in slots:
+                        prelude_slots.append((engine, slot))
+            packed_prelude = self._schedule_segment(prelude_slots)
+            self.instrs = (
+                packed_prelude
+                + [self.instrs[pause_idx]]
+                + self.instrs[pause_idx + 1 :]
+            )
+
 BASELINE = 147734
 
 def do_kernel_test(
@@ -804,6 +1444,16 @@ def do_kernel_test(
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
+    if prints:
+        print("INSTRS_START")
+        import json
+        # Filter out heavy debug ops for readability or just print structure
+        # Just print count
+        print(f"Instr count: {len(kb.instrs)}")
+        # Print first 200 instrs
+        for i, inst in enumerate(kb.instrs[:500]):
+            print(f"{i}: {inst}")
+        print("INSTRS_END")
     # print(kb.instrs)
 
     value_trace = {}
