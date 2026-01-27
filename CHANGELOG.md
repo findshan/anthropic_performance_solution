@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented here.
 
+## [2.2] - Engine-pressure scheduler & hash ALU offload
+- **性能变化**: `tests/submission_tests.py` 约 **1676 cycles**（`rounds=16, batch=256`），较 1678 进一步下降，正确性保持。
+- **调度器优化**: 增加按引擎压力的优先放置，再进行 backfill，提高每周期 slot 填充率。
+- **哈希压缩策略**: 对 hash 的 op1/op3 采用少量 ALU 旁路，缓解 VALU 峰值压力。
+
+## [2.3] - Multi-slot engine fill & hash ALU balance
+- **性能变化**: `tests/submission_tests.py` 约 **1669 cycles**（`rounds=16, batch=256`），继续下降并保持正确性。
+- **调度器优化**: 在引擎压力优先放置中，单引擎可多槽填充，减少同周期空位。
+- **哈希链路优化**: 将 op2 的 ALU 旁路与 op1/op3 对齐（中等比例），进一步缓和 VALU 峰值。
+
+## [2.5] - Flow vselect idx update
+- **性能变化**: `tests/submission_tests.py` 约 **1634 cycles**（`rounds=16, batch=256`），在保持正确性的前提下继续下降。
+- **索引更新压缩**: 使用 `flow vselect` 直接生成 `(val & 1) ? 2 : 1`，替代 `+1` 的 VALU 计算，降低 VALU 压力并提升 flow 利用率。
+
+## [2.4] - Prelude VLIW packing
+- **性能变化**: `tests/submission_tests.py` 约 **1660 cycles**（`rounds=16, batch=256`），进一步下降并保持正确性。
+- **早期利用率提升**: 将 pause 之前的初始化/预载指令打包为 VLIW 段，减少起始空槽。
+
+## [2.1] - Scheduler 2.0 backfill & depth3 safe mux
+- **性能变化**: `tests/submission_tests.py` 约 **1678 cycles**（`rounds=16, batch=256`），从 1685 回落并保持正确性。
+- **调度器 2.0**: 每周期多轮放置与 backfill，先按关键路径优先，再按引擎空余比例填洞，减少空槽与 WAR 因序阻塞。
+- **深度优化状态**: depth3 安全 mux 复活并稳定；depth4 mux 代码保留但默认关闭以避免性能回退。
+
+## [2.0] - Depth3 gather rollback & wrap idx prune
+- **性能变化**: cycles 约从 ~1680 降至 **~1678**（`rounds=16, batch=256`），维持正确性。
+- **正确性修复**: 临时禁用 depth3 mux，回退到 gather，规避 WAR 重排导致的错误选择。
+- **指令削减**: 在 wrap 与最后一轮跳过 idx 更新（不影响最终值），减少部分 VALU slot。
+
 ## [1.0] - VLIW 调度器升级 & 架构深度文档化
 - **性能突破**: 实现了从贪心打包到**依赖感知列表调度 (List Scheduling)** 的质变，Cycle 数从 ~2402 降至 **1771** (提升 ~26%)。
 - **调度器优化**:
