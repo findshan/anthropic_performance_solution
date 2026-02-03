@@ -1,6 +1,9 @@
 # Changelog
 
-All notable changes to this project will be documented here.
+## [3.0] - Wave-based Scheduler & Vectorized Kernel
+- **性能变化**: `tests/submission_tests.py` 约 **1425 cycles**（`rounds=16, batch=256`），相对 2.5 的 **1634 cycles** 大幅下降，保持正确性。
+- **架构升级**: 引入 "Wave-Based" 调度器，跨向量调度同类指令，最大化 VALU (6 slots) 利用率；重写 `schedule_ops` 以支持波次调度。
+- **实现要点**: 全向量化 Hash 流水线支持融合指令；使用 ALU (12 slots) 并行计算指针更新；新增 `architecture/v3.0.md` 文档。
 
 ## [2.2] - Engine-pressure scheduler & hash ALU offload
 - **性能变化**: `tests/submission_tests.py` 约 **1676 cycles**（`rounds=16, batch=256`），较 1678 进一步下降，正确性保持。
