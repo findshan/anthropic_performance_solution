@@ -1,6 +1,8 @@
-# Anthropic's Original Performance Take-Home
+# Anthropic's Original Performance Take-Home (Optimized)
 
-This repo contains a version of Anthropic's original performance take-home, before Claude Opus 4.5 started doing better than humans given only 2 hours.
+**Changelog**: [English](CHANGELOG.md) | [中文](CHANGELOG_ZH.md)
+
+This repo contains a highly optimized version of Anthropic's original performance take-home.
 
 The original take-home was a 4-hour one that starts close to the contents of this repo, after Claude Opus 4 beat most humans at that, it was updated to a 2-hour one which started with code which achieved 18532 cycles (7.97x faster than this repo starts you). This repo is based on the newer take-home which has a few more instructions and comes with better debugging tools, but has the starter code reverted to the slowest baseline. After Claude Opus 4.5 we started using a different base for our time-limited take-homes.
 

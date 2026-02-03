@@ -3,3 +3,10 @@ trace/
 **/*.pyc
 .hypothesis
 .DS_Store
+AGENTS.md
+architecture/
+optimizations/
+rules.md
+trace_any.py
+VERSION
+
