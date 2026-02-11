@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented here.
 
+## [3.1] - First-Principles Scheduler Refactor
+- **Performance**: ~**1415 cycles** (`rounds=16, batch=256`)
+  - **0.7% improvement** from v3.0 (1425 -> 1415 cycles)
+  - **99.0% improvement** from baseline (147734 -> 1415 cycles, ~104x faster)
+- **Scheduler architecture**: Refactored `schedule_ops` from strict per-group gating to guarded cross-group issuing with explicit per-slot read/write-set analysis.
+- **Correctness guardrails**:
+  - Keep `store` on strict group boundaries.
+  - Allow cross-group `load` only when no store has already been issued in the same cycle.
+  - Preserve same-cycle hazard safety using scratch dependency checks per vector.
+- **Kernel cleanup**:
+  - Removed unused `v_four` constant preloading/broadcast from prelude.
+  - Kept `prefetch_depth=2` with `depth>=3` dynamic gather path.
+
 ## [3.0] - Wave-based Scheduler & Vectorized Kernel
 - **Performance**: ~**1425 cycles** (`rounds=16, batch=256`)
   - **15% improvement** from v2.0 (1678 → 1425 cycles)

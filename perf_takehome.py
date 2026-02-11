@@ -100,20 +100,86 @@ class KernelBuilder:
         flow_vec = 0
         store_vec = 0
 
-        def can_issue(v, group_id):
+        def addrs(base, length):
+            return set(range(base, base + length))
+
+        def slot_rw(engine, slot):
+            if engine == "alu":
+                _op, dest, a1, a2 = slot
+                return ({a1, a2}, {dest})
+            if engine == "valu":
+                if slot[0] == "vbroadcast":
+                    _op, dest, src = slot
+                    return ({src}, addrs(dest, VLEN))
+                if slot[0] == "multiply_add":
+                    _op, dest, a, b, c = slot
+                    return (addrs(a, VLEN) | addrs(b, VLEN) | addrs(c, VLEN), addrs(dest, VLEN))
+                _op, dest, a1, a2 = slot
+                return (addrs(a1, VLEN) | addrs(a2, VLEN), addrs(dest, VLEN))
+            if engine == "load":
+                if slot[0] == "load":
+                    _op, dest, addr = slot
+                    return ({addr}, {dest})
+                if slot[0] == "load_offset":
+                    _op, dest, addr, offset = slot
+                    return ({addr + offset}, {dest + offset})
+                if slot[0] == "vload":
+                    _op, dest, addr = slot
+                    return ({addr}, addrs(dest, VLEN))
+                if slot[0] == "const":
+                    _op, dest, _val = slot
+                    return (set(), {dest})
+            if engine == "store":
+                if slot[0] == "store":
+                    _op, addr, src = slot
+                    return ({addr, src}, set())
+                if slot[0] == "vstore":
+                    _op, addr, src = slot
+                    return ({addr} | addrs(src, VLEN), set())
+            if engine == "flow":
+                if slot[0] == "select":
+                    _op, dest, cond, a, b = slot
+                    return ({cond, a, b}, {dest})
+                if slot[0] == "add_imm":
+                    _op, dest, a, _imm = slot
+                    return ({a}, {dest})
+                if slot[0] == "vselect":
+                    _op, dest, cond, a, b = slot
+                    return (addrs(cond, VLEN) | addrs(a, VLEN) | addrs(b, VLEN), addrs(dest, VLEN))
+            return (set(), set())
+
+        def can_issue(v, engine, slot, group_id, cycle_writes, cycle_has_store):
             if last_cycle[v] < cycle:
                 return True
-            return last_group[v] == group_id
+            if last_group[v] == group_id:
+                return True
+            # Relax strict group barrier only for non-memory engines when there's
+            # no intra-cycle scratch dependency.
+            if engine == "store":
+                return False
+            if last_group[v] is None or group_id != last_group[v] + 1:
+                return False
+            if engine == "load" and cycle_has_store[0]:
+                return False
+            reads, writes = slot_rw(engine, slot)
+            blocked = cycle_writes[v]
+            if reads & blocked:
+                return False
+            if writes & blocked:
+                return False
+            return True
 
         while remaining > 0:
             bundle = defaultdict(list)
+            cycle_writes = [set() for _ in range(len(vec_ops))]
+            cycle_has_store = [False]
 
             candidates = []
             for v, ops in enumerate(vec_ops):
                 if idxs[v] >= len(ops):
                     continue
                 op = ops[idxs[v]]
-                if not can_issue(v, op[2]):
+                if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                     continue
                 engine = op[0]
                 if engine != "valu":
@@ -139,6 +205,8 @@ class KernelBuilder:
                     if op[0] != "valu" or op[2] != group_id:
                         break
                     bundle["valu"].append(op[1])
+                    _reads, writes = slot_rw("valu", op[1])
+                    cycle_writes[v] |= writes
                     idxs[v] += 1
                     last_cycle[v] = cycle
                     last_engine[v] = "valu"
@@ -152,7 +220,7 @@ class KernelBuilder:
                 if idxs[v] >= len(ops):
                     continue
                 op = ops[idxs[v]]
-                if not can_issue(v, op[2]):
+                if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                     continue
                 if op[0] != "alu":
                     continue
@@ -175,6 +243,8 @@ class KernelBuilder:
                     if op[0] != "alu" or op[2] != group_id:
                         break
                     bundle["alu"].append(op[1])
+                    _reads, writes = slot_rw("alu", op[1])
+                    cycle_writes[v] |= writes
                     idxs[v] += 1
                     last_cycle[v] = cycle
                     last_engine[v] = "alu"
@@ -188,7 +258,7 @@ class KernelBuilder:
                 if idxs[v] >= len(ops):
                     continue
                 op = ops[idxs[v]]
-                if not can_issue(v, op[2]):
+                if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                     continue
                 if op[0] != "load":
                     continue
@@ -202,7 +272,7 @@ class KernelBuilder:
                 if idxs[v] >= len(vec_ops[v]):
                     continue
                 op = vec_ops[v][idxs[v]]
-                if not can_issue(v, op[2]):
+                if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                     continue
                 if op[0] != "load":
                     continue
@@ -220,6 +290,8 @@ class KernelBuilder:
                     if engine != "load" or op[2] != group_id:
                         break
                     bundle["load"].append(slot)
+                    _reads, writes = slot_rw("load", slot)
+                    cycle_writes[load_vec] |= writes
                     idxs[load_vec] += 1
                     last_cycle[load_vec] = cycle
                     last_engine[load_vec] = "load"
@@ -233,12 +305,14 @@ class KernelBuilder:
                     if idxs[v] >= len(ops):
                         continue
                     op = ops[idxs[v]]
-                    if not can_issue(v, op[2]):
+                    if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                         continue
                     engine, slot = op[0], op[1]
                     if engine != "load":
                         continue
                     bundle["load"].append(slot)
+                    _reads, writes = slot_rw("load", slot)
+                    cycle_writes[v] |= writes
                     idxs[v] += 1
                     last_cycle[v] = cycle
                     last_engine[v] = "load"
@@ -251,7 +325,7 @@ class KernelBuilder:
                 if idxs[v] >= len(ops):
                     continue
                 op = ops[idxs[v]]
-                if not can_issue(v, op[2]):
+                if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                     continue
                 if op[0] != "store":
                     continue
@@ -265,7 +339,7 @@ class KernelBuilder:
                 if idxs[v] >= len(vec_ops[v]):
                     continue
                 op = vec_ops[v][idxs[v]]
-                if not can_issue(v, op[2]):
+                if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                     continue
                 if op[0] != "store":
                     continue
@@ -283,6 +357,9 @@ class KernelBuilder:
                     if engine != "store" or op[2] != group_id:
                         break
                     bundle["store"].append(slot)
+                    _reads, writes = slot_rw("store", slot)
+                    cycle_writes[store_vec] |= writes
+                    cycle_has_store[0] = True
                     idxs[store_vec] += 1
                     last_cycle[store_vec] = cycle
                     last_engine[store_vec] = "store"
@@ -296,12 +373,15 @@ class KernelBuilder:
                     if idxs[v] >= len(ops):
                         continue
                     op = ops[idxs[v]]
-                    if not can_issue(v, op[2]):
+                    if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                         continue
                     engine, slot = op[0], op[1]
                     if engine != "store":
                         continue
                     bundle["store"].append(slot)
+                    _reads, writes = slot_rw("store", slot)
+                    cycle_writes[v] |= writes
+                    cycle_has_store[0] = True
                     idxs[v] += 1
                     last_cycle[v] = cycle
                     last_engine[v] = "store"
@@ -315,7 +395,7 @@ class KernelBuilder:
                 if idxs[v] >= len(ops):
                     continue
                 op = ops[idxs[v]]
-                if not can_issue(v, op[2]):
+                if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                     continue
                 if op[0] != "flow":
                     continue
@@ -330,6 +410,8 @@ class KernelBuilder:
                 ops = vec_ops[flow_vec]
                 op = ops[idxs[flow_vec]]
                 bundle["flow"].append(op[1])
+                _reads, writes = slot_rw("flow", op[1])
+                cycle_writes[flow_vec] |= writes
                 idxs[flow_vec] += 1
                 last_cycle[flow_vec] = cycle
                 last_engine[flow_vec] = "flow"
@@ -586,7 +668,7 @@ class KernelBuilder:
         node_addr2 = self.alloc_scratch("node_addr2")
         node_val2 = self.alloc_scratch("node_val2")
 
-        prefetch_depth = min(forest_height, 2)  # Depth 3+用load更快
+        prefetch_depth = min(forest_height, 2)
         max_prefetch_idx = (1 << (prefetch_depth + 1)) - 2
         node_vecs = [None] * (max_prefetch_idx + 1)
         for idx in range(max_prefetch_idx + 1):
@@ -737,10 +819,7 @@ class KernelBuilder:
         # Initial load with aggressive parallelization
         for v in range(0, n_vecs, 2):
             par_ops = []
-            # Zero-init indices (6 VALU slots) + pointer updates (12 ALU slots) + loads (2 load slots)
-            par_ops.append(("valu", ("^", idx_base + v * VLEN, idx_base + v * VLEN, idx_base + v * VLEN)))
-            if v + 1 < n_vecs:
-                par_ops.append(("valu", ("^", idx_base + (v + 1) * VLEN, idx_base + (v + 1) * VLEN, idx_base + (v + 1) * VLEN)))
+            # Scratch starts at zero; only update pointers and load initial values.
             par_ops.append(("alu", ("+", val_p0, val_p0, stride)))
             par_ops.append(("alu", ("+", val_p1, val_p1, stride)))
             par_ops.append(("load", ("vload", val_base + v * VLEN, val_p0)))
@@ -830,26 +909,22 @@ class KernelBuilder:
                     if r != rounds - 1:
                         add_op("load", ("vload", idx_vec, idx_ptrs[v]))
                 else:
-                    # Depth >= 3: dynamic memory loading
+                    # Depth >= 3: dynamic memory loading (in-place gather)
                     base_vec = depth_base_vecs[depth]
                     add_op("valu", ("+", tmp1_vec, idx_vec, base_vec))
                     # Load all 8 elements using load_offset (4 cycles minimum with 2 load slots)
                     for offset in range(0, VLEN, 2):
                         par_ops = [
-                            ("load", ("load_offset", tmp2_vec, tmp1_vec, offset)),
+                            ("load", ("load_offset", tmp1_vec, tmp1_vec, offset)),
                         ]
                         if offset + 1 < VLEN:
                             par_ops.append(
-                                ("load", ("load_offset", tmp2_vec, tmp1_vec, offset + 1))
+                                ("load", ("load_offset", tmp1_vec, tmp1_vec, offset + 1))
                             )
                         add_parallel(par_ops)
-                    add_op("valu", ("^", val_vec, val_vec, tmp2_vec))
+                    add_op("valu", ("^", val_vec, val_vec, tmp1_vec))
 
                 # Hash function: 6 stages, must be executed in order due to dependencies
-                # MICRO-OPTIMIZATION idea: Can we overlap index AND with hash?
-                # Problem: Need to avoid register conflicts
-                needs_idx_and = (r < rounds - 1 and depth != 0 and depth != forest_height)
-                
                 for hi, (op1, _val1, op2, op3, _val3) in enumerate(HASH_STAGES):
                     if hash_mul[hi] is not None:
                         # Fused instruction
@@ -864,15 +939,14 @@ class KernelBuilder:
                             ),
                         )
                     else:
-                        # Non-fused: two parallel operations followed by one sequential
+                        # Non-fused: keep parallelism, use val_vec for op3 to free tmp2
                         add_parallel(
                             [
                                 ("valu", (op1, tmp1_vec, val_vec, hash_const1[hi])),
-                                ("valu", (op3, tmp2_vec, val_vec, hash_const3[hi])),
+                                ("valu", (op3, val_vec, val_vec, hash_const3[hi])),
                             ]
                         )
-                        add_op("valu", (op2, val_vec, tmp1_vec, tmp2_vec))
-
+                        add_op("valu", (op2, val_vec, tmp1_vec, val_vec))
                 # Update index for next iteration
                 if r == rounds - 1:
                     # Last round - skip index update
