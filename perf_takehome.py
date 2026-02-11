@@ -155,8 +155,6 @@ class KernelBuilder:
                 return True
             # Relax strict group barrier only for non-memory engines when there's
             # no intra-cycle scratch dependency.
-            if engine == "store":
-                return False
             if last_group[v] is None or group_id != last_group[v] + 1:
                 return False
             if engine == "load" and cycle_has_store[0]:

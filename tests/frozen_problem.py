@@ -509,7 +509,7 @@ def build_mem_image(t: Tree, inp: Input) -> list[int]:
 
     mem[header:inp_indices_p] = t.values
     mem[inp_indices_p:inp_values_p] = inp.indices
-    mem[inp_values_p:] = inp.values
+    mem[inp_values_p : inp_values_p + len(inp.values)] = inp.values
     return mem
 
 
