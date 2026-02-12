@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented here.
 
+## [3.3] - Absolute-Address Kernel + Parametric Scheduler
+- **Performance**: ~**1368 cycles** (`rounds=16, batch=256`)
+  - **1.44% improvement** from v3.2 (1388 -> 1368 cycles)
+  - **99.07% improvement** from baseline (147734 -> 1368 cycles, ~108x faster)
+- **Kernel graph changes**:
+  - Reworked deep-tree path (`depth>=3`) to operate on **absolute addresses** in `idx_vec`, removing per-depth base-vector prebroadcast and reducing repeated address materialization.
+  - Added cached vector constants `v_depth3_base`, `v_abs_step` and derived `+1` variants for branchless index advancement via `flow vselect` + `multiply_add`.
+  - Kept depth-0/1/2 specialization with prefetched node vectors; retained pause compatibility behavior.
+- **Scheduler architecture**:
+  - Refactored `schedule_ops` to support parameterized priority policies (`SCHED_*`) across VALU/load/flow/store selection and round-robin biasing.
+  - Added tail-aware VALU ranking and controlled chunking modes for issue shaping in drain phase.
+- **Pointer/prelude optimization**:
+  - Removed vector index-pointer stream (`idx_ptrs`) and simplified prelude pointer construction to value pointers only.
+  - Continued using tree-doubling pointer construction for `val_ptrs`.
+- **Validation status**:
+  - Correctness tests pass; current bottleneck remains final speed threshold (`tests/submission_tests.py` expects `<1363`).
+
 ## [3.2] - Pre-loop & Scheduling Optimizations
 - **Performance**: ~**1388 cycles** (`rounds=16, batch=256`)
   - **1.9% improvement** from v3.1 (1415 -> 1388 cycles)
