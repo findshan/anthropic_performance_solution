@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented here.
 
+## [3.2] - Pre-loop & Scheduling Optimizations
+- **Performance**: ~**1388 cycles** (`rounds=16, batch=256`)
+  - **1.9% improvement** from v3.1 (1415 -> 1388 cycles)
+  - **99.06% improvement** from baseline (147734 -> 1388 cycles, ~106x faster)
+- **Pre-loop Optimization**: 
+  - Moved initial `vload` ops to main loop to overlap with VALU execution (-15 cycles).
+  - Replaced 32 `offset_base` constant loads with parallel ALU tree-doubling pointer computation (-12 cycles).
+  - Deduplicated hash constants (shared broadcast for identical values) to save load/flow slots.
+- **Scheduler**: Added round-robin tiebreaker for VALU candidates and removed conservative load-store conflict check to improve drain phase packing.
+
 ## [3.1] - First-Principles Scheduler Refactor
 - **Performance**: ~**1415 cycles** (`rounds=16, batch=256`)
   - **0.7% improvement** from v3.0 (1425 -> 1415 cycles)
