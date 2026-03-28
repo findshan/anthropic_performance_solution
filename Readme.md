@@ -1,6 +1,6 @@
 # Anthropic Performance Take-Home: Optimized Solution
 
-> **🚀 Achievement**: From **147,734 cycles** (baseline) to **1,425 cycles** — a **99% reduction** and **~104x speedup**
+> **🚀 Achievement**: From **147,734 cycles** (baseline) to **1,388 cycles** — a **99% reduction** and **~108x speedup**
 
 This repository showcases an extensively optimized implementation of [Anthropic's Original Performance Take-Home](https://github.com/anthropics/original_performance_takehome), demonstrating advanced techniques in VLIW architecture optimization, vectorization, and instruction-level parallelism.
 
