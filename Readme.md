@@ -9,7 +9,7 @@ This repository showcases an extensively optimized implementation of [Anthropic'
 | Metric | Value |
 |--------|-------|
 | **Baseline** | 147,734 cycles |
-| **Final (v3.0)** | 1,425 cycles |
+| **Final (v3.0)** | 1388 cycles |
 | **Improvement** | 99.0% reduction |
 | **Speedup** | ~104x faster |
 | **Test Suite** | `rounds=16, batch=256` |
