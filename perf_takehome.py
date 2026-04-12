@@ -969,14 +969,16 @@ class KernelBuilder:
                             ),
                         )
                     else:
-                        # Non-fused: keep parallelism, use val_vec for op3 to free tmp2
+                        # Non-fused: use tmp2 for op3 to avoid writing val_vec
+                        # in the parallel pair. This changes the dependency
+                        # pattern, potentially helping the scheduler.
                         add_parallel(
                             [
                                 ("valu", (op1, tmp1_vec, val_vec, hash_const1[hi])),
-                                ("valu", (op3, val_vec, val_vec, hash_const3[hi])),
+                                ("valu", (op3, tmp2_vec, val_vec, hash_const3[hi])),
                             ]
                         )
-                        add_op("valu", (op2, val_vec, tmp1_vec, val_vec))
+                        add_op("valu", (op2, val_vec, tmp1_vec, tmp2_vec))
                 # Update index for next iteration
                 if r == rounds - 1:
                     # Last round - skip index update
