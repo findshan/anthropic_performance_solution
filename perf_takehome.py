@@ -932,9 +932,16 @@ class KernelBuilder:
                         "flow",
                         ("vselect", idx_vec, tmp2_vec, tmp1_vec, idx_vec),
                     )
-                    add_op("valu", ("^", val_vec, val_vec, idx_vec))
                     if r != rounds - 1:
-                        add_op("load", ("vload", idx_vec, idx_ptrs[v]))
+                        # Merge XOR and idx reload in same group to shorten
+                        # serial chain. Safe: XOR reads idx (node val) before
+                        # vload writes idx (original) in same cycle.
+                        add_parallel([
+                            ("valu", ("^", val_vec, val_vec, idx_vec)),
+                            ("load", ("vload", idx_vec, idx_ptrs[v])),
+                        ])
+                    else:
+                        add_op("valu", ("^", val_vec, val_vec, idx_vec))
                 else:
                     # Depth >= 3: dynamic memory loading (in-place gather)
                     base_vec = depth_base_vecs[depth]
